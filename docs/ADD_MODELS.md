@@ -122,16 +122,51 @@ wsl -d debian-bookworm -- bash -c 'cd /opt/src/strata && \
 > 真正的专家总数计算在 `expert_source.cpp` 等处已经走 `g.n_expert`。已加 `n_experts_total()` 作为
 > 唯一的推导入口，替换散落的字面量。
 
-### 阶段 1：干掉 QSA indexer（2–3 天）
+### 阶段 1：干掉 QSA indexer（2–3 天）— **已完成，不需要新 kernel**
 
-两个目标模型**都没有** `indexer_*` / `hc_*` / `ngram_*` 张量。`check_layer()` 会直接报
-`missing blk.N.indexer.q_proj.weight`。
+> 原计划这里写着「2–3 天」。实际 **1 小时**，因为原计划假设要写新 kernel。不需要。
 
-改动：
-1. `Want2[]` 里把 `indexer.q_proj` / `indexer.k_proj` 标成 `qsa_only` 之外的可选项（或加 `bool required`）
-2. `src/core/layer.cpp` 的 QSA 层路径改成 `native_flash_attn.cu` 的全注意力（这个 kernel 已经在，因为 MTP 层用它）
-3. `include/strata/kernels/qsa.hpp` + `qsa.cu` + `qsa_select.cu` + `qsa_prompt_attn.cu` 对这两个 pack 是死代码 → 用 `#if` 或运行时分支跳过
-4. `src/plan/plan.hpp` 的显存预算公式要重算（没有 indexer key store，但多了 full attention 的 KV）
+`qsa_layer` 里 indexer 只干一件事：**算出 top-k 的 cell id**。没有 indexer 的 pack 需要全选。
+而 `qsa_selection_width(n_kv, s) = min(n_kv, idx_top_k + idx_block - 1)` —— 只要 `idx_top_k` 抬到
+`kTopkMaxCells`，全选**自动成立**。`qsa_index_step` + `topk_512` + `kv_gather` + `qsa_attend`
+一行不改就是稠密注意力。
+
+```cpp
+// include/strata/kernels/qsa.hpp，紧挨 QsaShapes
+inline QsaShapes qsa_shapes(const strata::core::ModelGeometry& g) {
+    QsaShapes s = qsa_real_shapes();
+    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads; s.idx_dim = g.idx_key_dim;
+    if (!g.has_indexer()) s.idx_top_k = kTopkMaxCells;   // ← 全部行为改动就这一行
+    return s;
+}
+```
+
+**顺带修掉一个真 bug**：旧代码无条件复制 `idx_top_k = 2048`。一个没有 indexer 的 pack 在 10K 上下文上
+会被静默截断成 2051 个 cell —— **输出有限、结果错、不报错**。测试里直接断言了这个数字。
+
+**顺带收掉 11 份重复**：这段算术此前抄在 `layer/mtp/session/verify/prefill(×4)/generate`，
+CUDA 侧 7 份 + `sycl/`(HIP) 侧 6 份。现在 `qsa_shapes` 是唯一定义。`qsa.hpp` 加了
+`#include "strata/core/layout.hpp"` —— 之前只 include `<cstdint>`，而 `layout.hpp`/`weights.hpp`
+都不碰 CUDA，所以测试纯 CPU 可编译。
+
+CUDA 侧和 sycl 侧一起改：只改一边会让 AMD 构建保留截断行为。
+
+**`ponytail:`** 每 token 仍跑一次全量 top-512 排序 —— 明知故犯的 O(n_kv log n_kv) 浪费，
+因为我们本来就知道答案是全选。换 decode 速度真的不够时，用 device 端 `iota` 直喂 `kv_gather`。
+上限仍是 `kTopkMaxCells = 32768`，`topk_512` 会明确报错而不是截断。
+
+测试：`tests/kernels/qsa_shapes_test.cpp`，15 个断言，纯 CPU。
+验证：`-Wall -Wextra` 无警告；5 处变异（删分支/取反/写死 2048/不取 n_head/预算减半）全部 `exit=1`。
+
+commit `9e1a9fd`。147 插入 / 90 删除。
+
+阶段 0 已经把 `Want2[]`/`Want1[]` 的子系统门做好了，所以原来这条待办
+「把 `indexer.q_proj` 标成可选」**已经完成**，不需要 `bool required`。剩下的是：
+
+- `qsa.cu` / `qsa_select.cu` / `qsa_prompt_attn.cu` 对这两个 pack 是死代码 → 用 `#if` 或运行时分支跳过
+- `src/plan/plan.hpp` 的显存预算公式要重算（没有 indexer key store，但多了 full attention 的 KV）
+- **`check_layer` 的 `hc_*` / `ngram_*` 门控阶段 0 已一起做完**（`WantSub::kHc` / `has_ple()`）
 
 **省的部分**：`check_layer` 里那些「indexer.head_count 计数错」的注释说明这块代码本身有历史 bug，
 少一套少一份风险。
