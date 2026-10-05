@@ -487,6 +487,33 @@ native_router_enabled() && NE == 512 && K == 10              // verify.cpp:909
 
 **3. `mtp`（Qwen3.6-35B 带 `mtp.layers.0`，`linear_fc1`/`linear_fc2`）完全没碰。**
 
-**4. 没有加载过任何 qwen35moe 权重。** 阶段 5（GGUF 量化）之前拿不到真文件。
+**4. 真实 qwen35moe 权重：已加载，但只到布局层。**
 
-。
+`bartowski/Qwen_Qwen3.6-35B-A3B-IQ2_XXS.gguf`（9.94 GiB，hf-mirror）现在是本地常驻，
+`tools/iq_pack.py` 对它的打包返回 `PACK_RC=0`：
+
+```
+index.txt: 630 tensors, 260 served natively, 0 in extra.bin, arena 0.05 GiB
+conversions.json: 140 tensors converted to the engine's form (140 exact, 0 rounded; max |err| 0)
+experts.bin: 41 layers, 8.60 GiB
+```
+
+`read_geometry` 对这份文件的真实 metadata 12/12 通过（`tests/core/q35_real_header_test.cpp`，
+用 `tools/copy_gguf_header.py` 截出的 10.7 MB header 跑，不需要整个下载）。真实文件推翻了三个
+从模型卡推出来的假设：
+
+| 从模型卡推的 | 文件里真实的 |
+|---|---|
+| `n_ff = 64` | **`expert_feed_forward_length = 512`** |
+| 40 层 | **`block_count = 41`**（40 主干 + 1 MTP，`nextn_predict_layers = 1`） |
+| 融合 `ffn_gate_up_exps` | **分离的 `ffn_gate_exps` + `ffn_up_exps`** |
+
+所以 `native_experts.txt` 是 **v5**，每行 `layer gu_type d_type offset blob_bytes gate_off up_off
+down_off`，把三矩阵分开记零拷贝偏移。第 40 层的 `gu_type/d_type` 是 **8/8（Q4_0）**，其余 40 层是
+16/17（IQ2_XS / IQ2_XXS）—— **层间量化类型不一致**，v3/v4 表表达不了。所有 41 层的区块都在文件内，
+最紧的第 40 层余 2.12 GiB。
+
+还没做：任何一次真实 token 的前向。WSL 里没有 GPU（`nvidia-smi` 不存在），而 `--native-bf16` /
+`--native-gdn` / `--native-router` 全部标注 CUDA-oracle，**没有 CPU native 推理路径**；真推理只能在
+Windows + RTX 3060 Laptop 6 GB 上靠 `--expert-cache N` 的 CPU 专家池 offload。
+
