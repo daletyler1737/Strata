@@ -87,6 +87,7 @@
 // The RAW tail is fp32 for the same reason and because it is only `idx_block - 1` rows.
 #pragma once
 
+#include "strata/core/layout.hpp"   // for the `ModelGeometry` `qsa_shapes` below takes
 #include <cstdint>
 
 namespace strata::kernels {
@@ -113,6 +114,29 @@ inline QsaShapes qsa_real_shapes() {
     // one page = one indexer block (4 cells): the granule KV streaming keeps resident (kv_stream.hpp). The readers
     // resolve a row per cell anyway, so the page size costs them nothing (measured: identical output and speed).
     s.page_size = 4;
+    return s;
+}
+
+/// `n_kv` must be <= `kTopkMaxCells` (32768): the selection runs in ONE block, which is what makes the
+/// ascending tie rule deterministic without a second pass over global memory.  Phase 3 replaces this with a
+/// radix select and Phase 7 raises the cap; until then a longer context is refused loudly.
+inline constexpr int64_t kTopkMaxCells = 32768;
+
+/// `QsaShapes` FROM a `ModelGeometry`, so no caller transcribes the two halves and they cannot drift.
+/// `ModelGeometry` carries the widths the LAYOUT needs; `QsaShapes` adds `n_rot`, `idx_block` and
+/// `idx_top_k`, which are kernel contracts.
+///
+/// ponytail: a pack with NO indexer (`Qwen3.8-27B`, `Qwen3.6-35B-A3B` - both `qwen3_5*_text`) takes the SAME
+/// kernels with the selection budget lifted to the whole context, which makes `qsa_selection_width` return
+/// `n_kv` - i.e. dense attention - through code that already exists.  The price is one top-512 sort per token
+/// over all `n_kv` cells: O(n_kv log n_kv) work spent on an answer we already knew.  Replace with a device
+/// `iota` feeding `kv_gather` when decode speed on a 27B pack actually matters.  Ceiling today is
+/// `kTopkMaxCells` (32768) - `topk_512` refuses a longer context loudly instead of truncating.
+inline QsaShapes qsa_shapes(const strata::core::ModelGeometry& g) {
+    QsaShapes s = qsa_real_shapes();
+    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim;
+    s.idx_n_head = g.idx_q_heads; s.idx_dim = g.idx_key_dim;
+    if (!g.has_indexer()) s.idx_top_k = kTopkMaxCells;
     return s;
 }
 
@@ -275,12 +299,6 @@ void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const flo
 /// `cap` is the caller's buffer size in ids and must be >= the width; the kernel writes EXACTLY `width` and
 /// refuses rather than truncating.  The `-1` padding that `docs/capture-format.md` L66-73 describes is the
 /// capture writer's job, not this kernel's: the padded width is a property of the run, not of one token.
-///
-/// `n_kv` must be <= 32768 (`kTopkMaxCells`): the selection runs in ONE block, which is what makes the
-/// ascending tie rule deterministic without a second pass over global memory.  Phase 3 replaces this with a
-/// radix select and Phase 7 raises the cap; until then a longer context is refused loudly.
-inline constexpr int64_t kTopkMaxCells = 32768;
-
 void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_t cap, int32_t* ids,
               void* stream);
 
