@@ -441,23 +441,42 @@ def expert_layout(model: Model, src: pathlib.Path):
         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
     layout, lines, offset, n_split = [], [], 0, 0
     for l in range(n_layers):
+        # qwen35moe (Qwen3.6) ships ONE fused gate_up tensor per layer, where Flash-Next ships separate
+        # ffn_gate_exps / ffn_up_exps (llama.cpp's qwen35moe.cpp has both branches).  The blob layout is
+        # gate | up | down either way, so a fused tensor is split in half here - the halves are contiguous in
+        # the source, and native_experts.txt still records three offsets.
+        fused = "blk.%d.ffn_gate_up_exps.weight" % l
         names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
+        if any(n not in T for n in names) and fused in T:
+            names = [fused, fused, "blk.%d.ffn_down_exps.weight" % l]
         if any(n not in T for n in names):
             return "layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T))
-        ts = [T[n] for n in names]
+        ts = [T[n] for n in dict.fromkeys(names)]      # a fused tensor is one source, listed twice
         if any(t.expected_bytes() is None or len(t.shape) != 3 or int(t.shape[2]) != n_expert for t in ts):
             return "layer %d: an expert tensor is not [*, *, %d] of whole blocks" % (l, n_expert)
-        per = [t.expected_bytes() // n_expert for t in ts]
-        if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
+        if fused in T and names[0] == names[1]:
+            # a fused gate_up is [n_embd, 2*n_ff, n_expert]: gate is rows [0, n_ff), up is [n_ff, 2*n_ff).
+            # Split by ROWS, not bytes: the quantized rows of the two halves are the same width, so half the
+            # bytes is exactly n_ff rows - but only if shape[1] is even, which is what is checked here.
+            if int(ts[0].shape[1]) % 2:
+                return "layer %d: the fused gate_up has an odd second dimension (%d)" % (l, ts[0].shape[1])
+            per_gu = ts[0].expected_bytes() // n_expert // 2
+        else:
+            per_gu = ts[0].expected_bytes() // n_expert
+        per_dn = ts[-1].expected_bytes() // n_expert
+        if ts[0].type_id != ts[1].type_id:
             return "layer %d: gate and up differ in type" % l
-        blob = per[0] + per[1] + per[2]
-        layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, ts))
+        blob = 2 * per_gu + per_dn
+        layout.append((l, ts[0].type_id, ts[-1].type_id, offset, blob, ts, per_gu))
         ws = [model.where[n] for n in names]
+        offs = []
+        for k, w in enumerate(ws):
+            # up is not a separate tensor when gate and up are fused: it starts n_ff rows into the same one
+            offs.append(w[0].data_start + w[1].offset + (per_gu if k == 1 and names[1] == fused else 0))
         files = ["" if w[3] == src else w[3].name for w in ws]
         column = files[0] if len(set(files)) == 1 else ",".join(files)
         n_split += len(set(files)) != 1
-        line = "%d %d %d %d %d %d %d %d" % (l, ts[0].type_id, ts[2].type_id, offset, blob,
-                                            *[w[0].data_start + w[1].offset for w in ws])
+        line = "%d %d %d %d %d %d %d %d" % (l, ts[0].type_id, ts[-1].type_id, offset, blob, *offs)
         lines.append(line + ("" if not column else " " + column))
         offset += blob * n_expert
     if n_split:
@@ -495,6 +514,8 @@ def main() -> int:
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
     ap.add_argument("--base", help="optional: a Q2_0 canonical pack whose dense.bin holds the shared float tensors")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--skip-tokenizer", action="store_true",
+                    help="do not build <out>/tokenizer/ (a GGUF without tokenizer.ggml.tokens carries none)")
     ap.add_argument("--skip-experts", action="store_true", help="rewrite the index only")
     ap.add_argument("--compat-bf16", action="store_true",
                     help="dequantize small non-native projections to BF16 for ordinary Qwen4Exp GGUFs "
@@ -527,8 +548,17 @@ def main() -> int:
     want = experts_source(model, text, offset)
     reuse = path.exists() and path.stat().st_size == offset and read_json(sidecar) == want
 
-    def layer_blobs(blob, ts):
-        chunk = np.concatenate([model.bytes(t.name).reshape(n_expert, -1) for t in ts], axis=1)
+    def layer_blobs(blob, ts, per_gu):
+        # a fused gate_up contributes BOTH gate and up: rows [0, n_ff) and [n_ff, 2*n_ff), so the blob is
+        # gate | up | down per expert either way.  Slicing by rows is what makes the fused half come out right.
+        cols = []
+        for i, t in enumerate(ts):
+            rows = model.bytes(t.name).reshape(n_expert, -1)
+            if len(ts) == 2 and i == 0:
+                cols += [rows[:, :per_gu], rows[:, per_gu:]]
+            else:
+                cols.append(rows)
+        chunk = np.concatenate(cols, axis=1)
         assert chunk.shape == (n_expert, blob)             # (n_expert, blob): gate | up | down per expert
         return chunk
 
@@ -537,10 +567,10 @@ def main() -> int:
         # geometry packed into the same folder can share: compare the first and last blobs of the first, middle and
         # last layers with the GGUF too (six blobs, so an unchanged pack is still reused at once)
         with open(path, "rb") as f:
-            for l, gt, dt, off, blob, ts in (layout[0], layout[len(layout) // 2], layout[-1]):
+            for l, gt, dt, off, blob, ts, pgu in (layout[0], layout[len(layout) // 2], layout[-1]):
                 for e in (0, n_expert - 1):
                     f.seek(off + e * blob)
-                    want_blob = b"".join(model.bytes(t.name).reshape(n_expert, -1)[e].tobytes() for t in ts)
+                    want_blob = layer_blobs(blob, ts, pgu)[e].tobytes()
                     if f.read(blob) != want_blob:
                         reuse = False
         if not reuse:
@@ -562,7 +592,9 @@ def main() -> int:
         rc = index_standalone(src, out, model, a.compat_bf16)
     if rc:
         return rc
-    if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
+    if a.skip_tokenizer:
+        pass
+    elif not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
 
@@ -585,11 +617,11 @@ def main() -> int:
     sidecar.unlink(missing_ok=True)
     part = out / "experts.bin.tmp"
     with open(part, "wb") as fo:
-        for l, gt, dt, off, blob, ts in layout:
-            fo.write(layer_blobs(blob, ts).tobytes())
+        for l, gt, dt, off, blob, ts, pgu in layout:
+            fo.write(layer_blobs(blob, ts, pgu).tobytes())
             if l % 8 == 0:
-                print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
-                                                                        off / 2**30), flush=True)
+                print("  layer %2d  type %d/%d  blob %8d  at %.2f GiB" % (l, gt, dt, blob,
+                                                                off / 2**30), flush=True)
     part.replace(path)
     side_tmp = out / "experts.bin.src.json.tmp"
     side_tmp.write_text(json.dumps(want, indent=2) + "\n", encoding="utf-8")
