@@ -449,6 +449,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(q35_pack_load_test PRIVATE strata_engine)
     add_test(NAME q35_pack_load_test COMMAND q35_pack_load_test $ENV{STRATA_Q35_PACK})
     set_tests_properties(q35_pack_load_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    # native_expert_supported() over Qwen3.6's three real per-layer type pairs.  A host predicate - it reads the
+    # Fmt<> tables, not the GPU - so it runs without a card, which is the only place the STRATA_D_FMTS change can
+    # be checked on a machine whose CUDA build has no driver.
+    add_executable(native_down_types_test tests/kernels/native_down_types_test.cpp)
+    target_link_libraries(native_down_types_test PRIVATE strata_kernels)
+    add_test(NAME native_down_types_test COMMAND native_down_types_test)
+    set_tests_properties(native_down_types_test PROPERTIES TIMEOUT 60)
     # #326: a native pack's BF16 (--compat-bf16) PLE key stays in the arena; a quantized key row loads as before
     add_executable(native_dense_ple_key_test tests/core/native_dense_ple_key_test.cpp)
     target_link_libraries(native_dense_ple_key_test PRIVATE strata_engine)
