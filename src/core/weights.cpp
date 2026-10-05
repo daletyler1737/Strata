@@ -471,9 +471,4 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     return true;
 }
 
-const WeightRef* WeightTable::find(const std::string& name) const {
-    const auto it = table_.find(name);
-    return it == table_.end() ? nullptr : &it->second;
-}
-
 }  // namespace strata::core

@@ -128,7 +128,11 @@ public:
     bool load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
               const std::set<std::string>* skip = nullptr);
 
-    const WeightRef* find(const std::string& name) const;
+    const WeightRef* find(const std::string& name) const { return table_.count(name) ? &table_.at(name) : nullptr; }
+    /// Add or replace a row.  The loader is the only production writer; tests/core/layout_subsystem_test.cpp
+    /// uses this to hand `check_all` a table for an architecture no shipped pack has.  A public insert is
+    /// cheaper than teaching that test to synthesise a whole GGUF pack.
+    void insert(const std::string& name, const WeightRef& ref) { table_[name] = ref; }
     const std::map<std::string, WeightRef>& all() const { return table_; }
     const LoadReport& report() const { return report_; }
 

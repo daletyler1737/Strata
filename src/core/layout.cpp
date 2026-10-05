@@ -8,12 +8,22 @@ namespace {
 
 /// A required 2-D shape.  `ne0` is the CONTIGUOUS axis, matching the manifest and `s_gemv`'s convention
 /// (`y[o] = sum_i x[i]*W[i][o]`, row o contiguous of length ne0).
+///
+/// A tensor is asked for when BOTH gates open, and they are two independent questions:
+///   * `sub`  - does this PACK carry the subsystem at all?  A qwen3_5 pack has no hc, no indexer and no
+///     PLE head, so asserting their tensors would make every qwen3_5 load fail on a tensor the
+///     architecture does not have.  The assertion is right; the ARCHITECTURE is a different one.
+///   * `layer` - is this LAYER of that kind?  The indexer lives on the QSA layers only, so it needs both
+///     questions answered yes.
+enum class WantSub { kAny, kHc, kIndexer, kMoe };
+enum class WantLayer { kAny, kQsa, kGdn };
+
 struct Want2 {
     const char* suffix;
     int64_t ne0;
     int64_t ne1;
-    bool qsa_only;
-    bool gdn_only;
+    WantSub sub;
+    WantLayer layer;
 };
 
 /// A required element count and ENGINE FORM for a 1-D tensor.
@@ -29,8 +39,8 @@ struct Want1 {
     const char* suffix;
     int64_t elements;
     WeightKind kind;
-    bool qsa_only;
-    bool gdn_only;
+    WantSub sub;
+    WantLayer layer;
 };
 
 bool fail(std::string& err, const LayerView& v, const char* suffix, const char* what, int64_t got,
@@ -42,45 +52,61 @@ bool fail(std::string& err, const LayerView& v, const char* suffix, const char* 
     return false;
 }
 
+/// The two gates, as one question.  A qwen3_5 pack has no hc / indexer / PLE head and asserts none of their
+/// tensors; the GDN and QSA sets are keyed on the layer type.
+bool wanted(WantSub sub, WantLayer layer, const ModelGeometry& g, bool qsa) {
+    const bool pack_ok = sub == WantSub::kAny     ? true
+                       : sub == WantSub::kHc      ? g.has_hc()
+                       : sub == WantSub::kIndexer ? g.has_indexer()
+                       : sub == WantSub::kMoe     ? g.has_moe()
+                                                 : false;  // ponytail: closed enum
+    const bool layer_ok = layer == WantLayer::kAny ? true
+                        : layer == WantLayer::kQsa ? qsa
+                        : layer == WantLayer::kGdn ? !qsa
+                                                  : false;  // ponytail: closed enum
+    return pack_ok && layer_ok;
+}
+
 bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std::string& err) {
     const LayerView v(t, layer);
     const bool qsa = is_qsa_layer(g, layer);
 
-    // ---- the 2-D tensor set, per layer family
+    // ---- the 2-D tensor set, per layer family.  `hc_*` and `indexer.*` are Flash-Next only: a qwen3_5
+    // pack has neither and must not be asked for them.
     const Want2 want2[] = {
         // gated residual, EVERY layer - `gr_read` takes w_down (hc_lr, hc_dim) and w_up (hc_lr, hc_dim)
         // after its own transpose, so the pack's orientation is [hc_dim, hc_lr] and [hc_lr, hc_dim].
-        {"hc_attn_down.weight", g.hc_dim(), g.hc_lr, false, false},
-        {"hc_attn_up.weight", g.hc_lr, g.hc_dim(), false, false},
-        {"hc_attn_inject.weight", g.hc_dim(), g.hc, false, false},
-        {"hc_ffn_down.weight", g.hc_dim(), g.hc_lr, false, false},
-        {"hc_ffn_up.weight", g.hc_lr, g.hc_dim(), false, false},
-        {"hc_ffn_inject.weight", g.hc_dim(), g.hc, false, false},
-        // MoE, EVERY layer
-        {"ffn_gate_inp.weight", g.n_embd, g.n_expert, false, false},
-        {"ffn_gate_shexp.weight", g.n_embd, g.n_ff, false, false},
-        {"ffn_up_shexp.weight", g.n_embd, g.n_ff, false, false},
-        {"ffn_down_shexp.weight", g.n_ff, g.n_embd, false, false},
+        {"hc_attn_down.weight", g.hc_dim(), g.hc_lr, WantSub::kHc, WantLayer::kAny},
+        {"hc_attn_up.weight", g.hc_lr, g.hc_dim(), WantSub::kHc, WantLayer::kAny},
+        {"hc_attn_inject.weight", g.hc_dim(), g.hc, WantSub::kHc, WantLayer::kAny},
+        {"hc_ffn_down.weight", g.hc_dim(), g.hc_lr, WantSub::kHc, WantLayer::kAny},
+        {"hc_ffn_up.weight", g.hc_lr, g.hc_dim(), WantSub::kHc, WantLayer::kAny},
+        {"hc_ffn_inject.weight", g.hc_dim(), g.hc, WantSub::kHc, WantLayer::kAny},
+        // MoE, EVERY layer.  A dense pack asserts only the shared-expert trio and skips the router.
+        {"ffn_gate_inp.weight", g.n_embd, g.n_expert, WantSub::kMoe, WantLayer::kAny},
+        {"ffn_gate_shexp.weight", g.n_embd, g.n_ff, WantSub::kAny, WantLayer::kAny},
+        {"ffn_up_shexp.weight", g.n_embd, g.n_ff, WantSub::kAny, WantLayer::kAny},
+        {"ffn_down_shexp.weight", g.n_ff, g.n_embd, WantSub::kAny, WantLayer::kAny},
         // GDN only
-        {"attn_qkv.weight", g.n_embd, g.ssm_conv_channels, false, true},
-        {"attn_gate.weight", g.n_embd, g.ssm_value_dim, false, true},
-        {"ssm_out.weight", g.ssm_value_dim, g.n_embd, false, true},
-        {"ssm_conv1d.weight", g.ssm_d_conv, g.ssm_conv_channels, false, true},
-        {"ssm_alpha.weight", g.n_embd, g.ssm_v_heads, false, true},
-        {"ssm_beta.weight", g.n_embd, g.ssm_v_heads, false, true},
+        {"attn_qkv.weight", g.n_embd, g.ssm_conv_channels, WantSub::kAny, WantLayer::kGdn},
+        {"attn_gate.weight", g.n_embd, g.ssm_value_dim, WantSub::kAny, WantLayer::kGdn},
+        {"ssm_out.weight", g.ssm_value_dim, g.n_embd, WantSub::kAny, WantLayer::kGdn},
+        {"ssm_conv1d.weight", g.ssm_d_conv, g.ssm_conv_channels, WantSub::kAny, WantLayer::kGdn},
+        {"ssm_alpha.weight", g.n_embd, g.ssm_v_heads, WantSub::kAny, WantLayer::kGdn},
+        {"ssm_beta.weight", g.n_embd, g.ssm_v_heads, WantSub::kAny, WantLayer::kGdn},
         // QSA only
-        {"attn_q.weight", g.n_embd, 2 * g.n_head * g.head_dim, true, false},
-        {"attn_k.weight", g.n_embd, g.n_head_kv * g.head_dim, true, false},
-        {"attn_v.weight", g.n_embd, g.n_head_kv * g.head_dim, true, false},
-        {"attn_output.weight", g.n_head * g.head_dim, g.n_embd, true, false},
+        {"attn_q.weight", g.n_embd, 2 * g.n_head * g.head_dim, WantSub::kAny, WantLayer::kQsa},
+        {"attn_k.weight", g.n_embd, g.n_head_kv * g.head_dim, WantSub::kAny, WantLayer::kQsa},
+        {"attn_v.weight", g.n_embd, g.n_head_kv * g.head_dim, WantSub::kAny, WantLayer::kQsa},
+        {"attn_output.weight", g.n_head * g.head_dim, g.n_embd, WantSub::kAny, WantLayer::kQsa},
         // THE INDEXER.  `q_proj` is the QUERY count and `k_proj` is the KEY width, and they are different
         // numbers - conflating them is what made the planner's indexer term 4x too big in round 194.
-        {"indexer.q_proj.weight", g.n_embd, g.idx_q_heads * g.idx_key_dim, true, false},
-        {"indexer.k_proj.weight", g.n_embd, g.idx_key_dim, true, false},
+        // qwen3_5 has full attention with no indexer, so these are asked of nobody.
+        {"indexer.q_proj.weight", g.n_embd, g.idx_q_heads * g.idx_key_dim, WantSub::kIndexer, WantLayer::kQsa},
+        {"indexer.k_proj.weight", g.n_embd, g.idx_key_dim, WantSub::kIndexer, WantLayer::kQsa},
     };
     for (const Want2& w : want2) {
-        if (w.qsa_only && !qsa) continue;
-        if (w.gdn_only && qsa) continue;
+        if (!wanted(w.sub, w.layer, g, qsa)) continue;
         const WeightRef* r = v.get(w.suffix);
         if (!r) {
             err = "layer " + std::to_string(layer) + ": missing " + v.name(w.suffix);
@@ -94,20 +120,19 @@ bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std:
     // and that single exception is the one a reader would not guess, so it is written down rather than
     // inferred from the tensor count.
     const Want1 want1[] = {
-        {"hc_attn_norm.weight", g.hc_dim(), WeightKind::F32, false, false},
-        {"hc_ffn_norm.weight", g.hc_dim(), WeightKind::F32, false, false},
-        {"ffn_gate_inp_shexp.weight", g.n_embd, WeightKind::Bf16InF32, false, false},
-        {"ssm_a", g.ssm_v_heads, WeightKind::F32, false, true},
-        {"ssm_dt.bias", g.ssm_v_heads, WeightKind::F32, false, true},
-        {"ssm_norm.weight", g.ssm_state_size, WeightKind::F32, false, true},
-        {"attn_q_norm.weight", g.head_dim, WeightKind::F32, true, false},
-        {"attn_k_norm.weight", g.head_dim, WeightKind::F32, true, false},
-        {"indexer.q_norm.weight", g.idx_key_dim, WeightKind::F32, true, false},
-        {"indexer.k_norm.weight", g.idx_key_dim, WeightKind::F32, true, false},
+        {"hc_attn_norm.weight", g.hc_dim(), WeightKind::F32, WantSub::kHc, WantLayer::kAny},
+        {"hc_ffn_norm.weight", g.hc_dim(), WeightKind::F32, WantSub::kHc, WantLayer::kAny},
+        {"ffn_gate_inp_shexp.weight", g.n_embd, WeightKind::Bf16InF32, WantSub::kAny, WantLayer::kAny},
+        {"ssm_a", g.ssm_v_heads, WeightKind::F32, WantSub::kAny, WantLayer::kGdn},
+        {"ssm_dt.bias", g.ssm_v_heads, WeightKind::F32, WantSub::kAny, WantLayer::kGdn},
+        {"ssm_norm.weight", g.ssm_state_size, WeightKind::F32, WantSub::kAny, WantLayer::kGdn},
+        {"attn_q_norm.weight", g.head_dim, WeightKind::F32, WantSub::kAny, WantLayer::kQsa},
+        {"attn_k_norm.weight", g.head_dim, WeightKind::F32, WantSub::kAny, WantLayer::kQsa},
+        {"indexer.q_norm.weight", g.idx_key_dim, WeightKind::F32, WantSub::kIndexer, WantLayer::kQsa},
+        {"indexer.k_norm.weight", g.idx_key_dim, WeightKind::F32, WantSub::kIndexer, WantLayer::kQsa},
     };
     for (const Want1& w : want1) {
-        if (w.qsa_only && !qsa) continue;
-        if (w.gdn_only && qsa) continue;
+        if (!wanted(w.sub, w.layer, g, qsa)) continue;
         const WeightRef* r = v.get(w.suffix);
         if (!r) {
             err = "layer " + std::to_string(layer) + ": missing " + v.name(w.suffix);

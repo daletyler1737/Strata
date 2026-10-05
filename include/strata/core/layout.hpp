@@ -44,18 +44,35 @@ struct ModelGeometry {
     int64_t idx_q_heads = 4;
     int64_t idx_key_dim = 128;
 
-    // gated residual, on every layer
+    // PLE n-gram order, 0 = no PLE head.  Strata's shipped Flash-Next pack uses 3; the two qwen3_5
+    // targets have no ngram head at all and must not build the 28.8 GB table.
+    int64_t ple_ngram_size = 3;
+
+    // gated residual, on every layer.  A pack without `hc_*` tensors (qwen3_5_text, qwen3_5_moe_text)
+    // carries the zeros here; every consumer must ask `has_hc()` before reading them.
     int64_t hc = 4;
     int64_t hc_lr = 320;
 
-    // MoE, on every layer
+    // MoE, on every layer.  A DENSE pack has no `ffn_gate_inp.weight`; n_expert = 0 says so.
     int64_t n_expert = 512;
     int64_t n_ff = 640;
+
+    /// WHICH SUBSYSTEMS THIS PACK HAS, derived from the numbers above instead of stored beside them.
+    /// A second set of flags is a second thing to disagree with the geometry, which is what this struct
+    /// exists to prevent - so each is a comparison against a field the pack already pins.
+    bool has_moe() const { return n_expert > 0; }
+    bool has_hc() const { return hc > 0; }
+    bool has_indexer() const { return idx_q_heads > 0; }
+    /// A pack whose config has no ngram head (the two qwen3_5 targets) must not build the table.
+    bool has_ple() const { return ple_ngram_size > 0; }
 
     int64_t hc_dim() const { return hc * n_embd; }
     /// `layer % qsa_interval == qsa_interval - 1` is full attention.  Derived, not a second list.
     int64_t n_qsa_layers() const { return n_layers / qsa_interval; }
     int64_t n_gdn_layers() const { return n_layers - n_qsa_layers(); }
+    /// Every expert the pack holds, `layer * n_expert + expert`.  The frequency profile and the expert
+    /// cache index by this, so it must be the geometry's arithmetic and not a constant anywhere.
+    int64_t n_experts_total() const { return n_layers * n_expert; }
 };
 
 /// True for the full-attention layers.  `docs/semantics.md` gives this twice over - `full_attention_interval
