@@ -388,6 +388,62 @@ native_embed.load(..., g0.n_embd, 248320);              // (2) 加上字面词�
 本轮改动让 native 路径正确，canonical 行为不变。要让 canonical 也支持别的模型，得给
 `generate` 加一个模型 GGUF 参数，那是新功能，不在阶段 3 范围。
 
+#### 那 826 处**全在 canonical Q2_0 路径** —— native 路径的几何已经就绪
+
+查过之后最重要的一条。`H/FF/NE/BLOB` 的消费者里，最大两块是
+`src/kernels/cuda/s2_expert_grouped.cu`（164）和它的 SYCL 镜像（164）。而那个文件里：
+
+```
+native       0 处
+fmt          0 处
+f\.n_ff      0 处
+gu_row       0 处
+```
+
+**它完全不含 native 概念** —— 是 canonical Q2_0 专用。
+
+native（IQ）路径的几何**本来就是运行时的**，CPU 和 GPU 两侧都是：
+
+```cpp
+// include/strata/kernels/cpu/native_expert.hpp
+struct NativeFmt {
+    int gu_type, d_type;
+    int64_t n_embd, n_ff;
+    size_t gu_row, d_row, up_off, down_off, bytes;
+};
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+
+// src/kernels/cuda/iq_kernels.cu
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+    L.gu_row = iq_row_bytes(gu_type, n_embd);
+    L.d_row  = iq_row_bytes(d_type,  n_ff);
+    L.up_off = (size_t) n_ff * L.gu_row;      // 运行时算，不是编译期
+    L.down_off = 2 * L.up_off;
+    L.bytes = L.down_off + (size_t) n_embd * L.d_row;
+}
+```
+
+**所以路线是清楚的**：Qwen3.6-35B 走 native（IQ）路径，那 826 处一行都不用碰。
+canonical Q2_0 路径的 826 处是"让 canonical 也支持别的形状"的工作，不在阶段 3 的目标里
+（而且 canonical 连模型 GGUF 参数都没有，见上面）。
+
+`tools/iq_pack.py` 也已经参数化（`n_expert` 从 router 张量读、`blob` 从张量字节算、注释明写
+支持 pruned 模型），所以**产物侧不需要写代码**。
+
+#### 一个必须区分的坑：路由专家宽度有两条来源
+
+`read_geometry` 里：
+
+```cpp
+if (const MetaValue* v = g.get(p + "expert_feed_forward_length")) out.n_ff = v->u;   // 直接取
+else if (const MetaValue* v2 = g.get(p + "expert_used_count"))                          // 512/top_k
+    out.n_ff = out.n_ff / used;
+```
+
+**带 `expert_feed_forward_length` 的文件根本走不到除法分支。** 我第一版 fixture 带了那个 key，
+结果变异"路由宽度不除"存活 —— 不是变异脚本写错，是**测试漏了整条分支**。
+现在两个 fixture 都做（`tools/make_q35_fixture.py --no-routed-ff`），7/7 变异全抓住。
+
 **2. decode 路径已有守卫但也有硬编码**（`src/core/layer.cpp` / `verify.cpp`）：
 
 ```cpp
