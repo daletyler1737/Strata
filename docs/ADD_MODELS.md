@@ -308,53 +308,73 @@ prompt 路径里是耦合的**，动 GR 要连带看 PLE。
 
 #### 阶段 3 剩下的真活（已实测，不是估计）
 
-**真正的瓶颈不是那 289 处，而是专家 blob 的字节布局本身。**
+**我数错了两次，把准确的数字和顺序钉在这里。**
 
-我先数了 prompt 路径的编译期常量（`prefill.cpp:90`，`N/K/D/ZV/LR/HC/HV/C/NE`，共 **289 处**），
-正准备动手。但往下查了一层，发现这些常量本身不是终点：
+#### 第一版：我说"剩下 289 处"
 
-```cpp
-// include/strata/kernels/cpu/expert.hpp:33
-// ---- geometry, all of it fixed by the artifact (tools/verify_q2_0_geometry.py: 202/202 tensors at QK=64) ----
-inline constexpr int H = 2560;      // n_embd
-inline constexpr int FF = 640;      // expert intermediate width
-inline constexpr int NE = 512;      // routed experts per layer
-inline constexpr size_t BLOB = 3ull * (H * FF * BB / QK);   // 1,382,400
+数的是 `prefill.cpp:90` 那 9 个局部 `constexpr`（N/K/D/ZV/LR/HC/HV/C/NE）。数字对，范围错。
+
+#### 第二版：我说"真正的瓶颈是 blob 字节布局"
+
+方向对了，但**错在认定打包器是阻塞点**。查了 `tools/iq_pack.py`（真正写 `experts.bin` 的那个，
+22 处引用），它**已经完全参数化**：
+
+```python
+n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
+per = [t.expected_bytes() // n_expert for t in ts]
+blob = per[0] + per[1] + per[2]
 ```
 
-**`H / FF / NE / BLOB` 是产物格式的常量，不是 prompt 路径的局部常量。** 三个 prefill kernel 把 blob 的
-字节偏移写死在编译期：
+`n_expert` 从 router 张量读、`blob` 从张量实际字节算，注释里明写着支持裁剪模型。**打包器不用改。**
+我上一版引用注释里那个 `tools/verify_q2_0_geometry.py` —— 那个文件在仓库里根本不存在，是我记错了。
+
+#### 实际数字：826 处，21 个文件
+
+`H/FF/NE/BLOB/QK/BB/ROW_GU/ROW_D/SC_GU/SC_D/MAXC/QKA` 这些格式常量的全部消费者：
+
+| 文件 | 引用数 | 备注 |
+|---|---|---|
+| `src/kernels/cuda/s2_expert_grouped.cu` | 164 | CUDA 主路径，最大头 |
+| `src/kernels/native_expert_parity.cpp` | 141 | 数值对照 |
+| `src/kernels/cpu/expert.cpp` | 99 | CPU 专家 kernel |
+| `sycl/src/kernels/cuda/s2_expert_grouped.dp.cpp` | 164 | SYCL 镜像 |
+| `sycl/src/kernels/native_expert_parity.cpp` | 91 | |
+| `src/prefill/prefill.cpp` | 32 | |
+| 其余 15 个 | 共 135 | 含 `sycl/` 镜像（两份要一起改） |
+
+大头是 CUDA 和 SYCL 两份镜像（各 164），改一份就得改另一份。
+
+#### 顺序（这次钉死）
+
+1. **产物 —— 已经通了。** `iq_pack.py` 参数化，Qwen3.6-35B 的 256×64×2048 能直接打包。
+   阶段 5 的打包这半**不需要写代码**。
+2. **`H/FF/NE/BLOB` 从编译期改成按产物填。** `ExpertLayout` 已经有 `bytes[]`（每层 blob 大小）、
+   `native` 分支、`gguf_off`；但 Q2_0 那条非 native 分支 `blob_bytes()` 直接 `return BLOB`。
+   这是**真正的第一处代码改动**，一处。
+3. **然后是 826 处的机械替换。** `H → layout` 推出的宽度、`NE → m.g->n_expert`。
+
+`sycl/` 是 CUDA 的镜像目录，改 CUDA 必须同步改 SYCL，否则两份行为分叉。
+
+#### 已确认的一个真缺口（不是全部）
+
+`src/program/generate.cpp:1996` 用**默认构造**的几何去加载专家 layout：
 
 ```cpp
-// src/prefill/moe_mmq.cu:60, kernels.cu:660, moe_fused.cu:46 —— 同一个式子抄了三遍
-constexpr size_t O_D_CODES = (size_t) 1280 * 640, O_GU_SC = O_D_CODES + (size_t) 2560 * 160,
-               O_D_SC = O_GU_SC + (size_t) 1280 * 40 * 2;
+const strata::core::ModelGeometry g0;                                  // = Flash-Next: 48 层 / 512 专家
+if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err))
 ```
 
-`1280 = 2 × FF`（gate/up 各一行）、`2560 = H`、`40 = H/QK`。而 `O_D_CODES = 1280 × 640` 就是
-`BLOB` 的主要成分。
+而 GGUF 到 **L2077** 才打开、L2082 才 `read_geometry`。**顺序反了** —— 加载 layout 时拿不到真几何。
 
-#### 所以真正的顺序是
+- **native（IQ）路径：已经安全。** `expert_layout_load` 从 `native_experts.txt` 头读
+  `(n_expert N, ...)`，注释明写"a pruned model ships fewer experts than the canonical geometry the caller
+  passes, which is a compile-time default, so the header wins"。调用方传错也无所谓。
+- **canonical（Q2_0）路径：有洞。** 没有 `native_experts.txt`，`!in` 分支直接用调用方的
+  `n_layers / n_expert / BLOB`。`experts.bin` 是纯字节流，无元数据可反推。
 
-要让 Qwen3.6-35B 跑起来，改的顺序**不能反**：
-
-1. **先有产物。** blob 的布局（哪些行、什么量化、多宽）由打包器
-   `tools/verify_q2_0_geometry.py` 定的，而这个打包器是**为 Flash-Next 的 512×640×2560 写的**。
-   Qwen3.6-35B 是 256 专家 × 64 宽 × 2048。**产物里目前没有这种形状** —— 这是阶段 5。
-2. **产物有了，`H/FF/NE/BLOB` 才能按产物填。** `ExpertLayout` 已经有 `bytes[]`（每层 blob 大小）
-   和 `native` 分支，但 Q2_0 那条非 native 分支直接返回编译期的 `BLOB`。
-3. **然后才是那 289 处。** `N → m.g->n_embd`、`K → m.ss->k`、`NE → m.g->n_expert`，机械替换。
-
-反过来做（先改 289 处、再想办法对上产物）会得到一个**编译通过、数值错误**的版本：kernel 按 2048 读
-一个按 2560 排布的 blob，读到的是有限的、看起来合理的错数字 —— 和阶段 4 那个 27 倍越界同一类，
-但这次连 L737 那道门都拦不住（因为几何本身是对的，只是 blob 布局不对）。
-
-#### 那道门拦得住什么、拦不住什么
-
-L737 检查 `g.n_embd != N || g.hc != HC || ...`：几何不一致 → 明确报错。这挡得住"拿 qwen35moe 的
-几何配 Flash-Next 的常量"。但一旦 blob 布局那层没跟上，几何全对而字节偏移错，门是绿的。
-
-**所以阶段 3 的正确前置是阶段 5（GGUF 打包），不是那 289 处。**
+所以 Qwen3.6-35B 走 Q2_0 会用 512 专家 / 2560 宽去解释一个 256×64×2048 的 blob。
+修法不是传参（拿不到），是**把 layout 加载移到 `read_geometry` 之后**，或给 canonical 路径补一份
+manifest。这一步要先动启动顺序，属于阶段 5 的产物侧。
 
 **2. decode 路径已有守卫但也有硬编码**（`src/core/layer.cpp` / `verify.cpp`）：
 
