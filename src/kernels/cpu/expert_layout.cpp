@@ -1,6 +1,7 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -335,15 +336,51 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         L.bytes[(size_t) l] = blob;
         if (blob > L.max_blob) L.max_blob = blob;
     }
+    // **A PACK'S OFFSET COLUMN MEANS DIFFERENT THINGS BY VERSION, AND THE LOOP MUST NOT ASSUME ONE.**
+    //
+    // Up to v4 the offset column was an index into the pack's OWN compact arena: layer l sits at
+    // sum(bytes[i] * n_expert for i < l), because the arena is written layer by layer with every expert of a
+    // layer together.  Requiring that sum catches a truncated or reordered manifest.
+    //
+    // v5 records ABSOLUTE byte offsets into the ORIGINAL GGUF, zero-copy: the tensor is read where the
+    // quantizer put it and experts of one layer are NOT adjacent there either, because the quantizer emitted
+    // ffn_gate_exps, ffn_up_exps and ffn_down_exps as three whole-model tensors in that order.  On Qwen3.6-35B
+    // layer 4 ends at 864026624 + 256 * 843776 = 1080033280 exactly where layer 5 begins - which is also not
+    // the compact-arena sum - so the v4 check rejects a perfectly good pack at layer 41 with "layer 41 is
+    // missing or not contiguous".
+    //
+    // So: keep the compact check for the versions that mean it, and for v5 check what its column actually
+    // promises - every layer present, no two layers overlapping, and the span inside the arena's file.
     uint64_t at = 0;
-    for (int64_t l = 0; l < n_layers; ++l) {
-        if (L.offset[(size_t) l] != at) {
-            err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
-            return false;
+    if (L.version < 5) {
+        for (int64_t l = 0; l < n_layers; ++l) {
+            if (L.offset[(size_t) l] != at) {
+                err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
+                return false;
+            }
+            at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
         }
-        at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
+        L.total = at;
+    } else {
+        std::vector<std::pair<uint64_t, uint64_t>> spans;
+        spans.reserve((size_t) n_layers);
+        for (int64_t l = 0; l < n_layers; ++l) {
+            const uint64_t o = L.offset[(size_t) l], span = L.bytes[(size_t) l] * (uint64_t) L.n_expert;
+            if (o == 0 && l > 0 && span == 0) {          // a layer with neither offset nor bytes was never written
+                err = "native_experts.txt: layer " + std::to_string(l) + " is missing";
+                return false;
+            }
+            spans.emplace_back(o, span);
+        }
+        std::sort(spans.begin(), spans.end());
+        for (size_t i = 1; i < spans.size(); ++i) {
+            if (spans[i].first < spans[i - 1].first + spans[i - 1].second) {
+                err = "native_experts.txt: two layers overlap at byte " + std::to_string(spans[i].first);
+                return false;
+            }
+        }
+        L.total = spans.empty() ? 0 : spans.back().first + spans.back().second;
     }
-    L.total = at;
     g_layout = L;
     return true;
 #endif

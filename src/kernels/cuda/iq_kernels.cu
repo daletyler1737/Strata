@@ -523,7 +523,12 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(8)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
+// 16 (IQ2_XXS) and 17 (IQ2_XS) are here as well as in the gate/up list.  They were missing only from THIS list, so
+// the dot kernels and their Fmt<> templates already existed and were instantiated - but native_expert_supported()
+// answered qk == 0 for them and generate.cpp refused the pack at startup with "layer 0's experts are
+// IQ2_XXS/IQ2_XS ... no GPU kernels for".  That is exactly Qwen3.6-35B-A3B's down matrix: every layer ships
+// IQ2_XS (IQ2_XXS on ten of them), so nothing else in the list would ever have been reached.
+#define STRATA_D_FMTS(X) X(16) X(17) X(20) X(23) X(42) X(7) X(6) X(8)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8)
 
 __device__ __forceinline__ float warp_sum(float v) {
