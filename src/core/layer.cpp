@@ -878,7 +878,7 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, int cols) {
     try {
         if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
-        else rms_norm_weighted(data, (const float*) norm->data, rows, cols, RMS_EPS, stream);
+        else strata::kernels::rms_norm_weighted(data, (const float*) norm->data, rows, cols, RMS_EPS, stream);
         if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), st.pos_dev, stream);
         else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, st.pos_dev, stream);
         return true;
@@ -1125,8 +1125,11 @@ bool lm_head(const WeightTable& tables, const ModelGeometry& g, const BlockBuffe
                           g.n_embd, wo->ne1, "output.weight", stream, err);
 }
 // ================================ ONE WHOLE BLOCK ================================
-uint64_t block_buffers_bytes(const ModelGeometry& g) {    const strata::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    uint64_t n = 0;    n += (uint64_t) g.hc * g.n_embd * 4;
-// R
+uint64_t block_buffers_bytes(const ModelGeometry& g) {    const strata::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    uint64_t n = 0;    // R: the residual is a `hc`-wide STACK under a hyper-connection, and a plain `n_embd` vector without one.
+    // `g.hc` alone would be ZERO for Qwen3.6-35B / Qwen3.8-27B - no residual storage at all, which the
+    // plain `R += block_out` below then writes past.  `has_hc()`, not `hc != 0`, because that is what the
+    // loader checked.
+    n += (g.has_hc() ? (uint64_t) g.hc * g.n_embd : (uint64_t) g.n_embd) * 4;
 n += (uint64_t) g.n_embd * 4;
 // mixed
 n += (uint64_t) g.n_embd * 4;
@@ -1138,7 +1141,7 @@ n += (uint64_t) g.hc * 4 * 2 + 32;
 n += q8k_bytes(g.n_embd);
 // head_q8k
 n += strata::kernels::gr_workspace_bytes(s);    return align_up16(n) + 256;}
-uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b) {    const strata::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    Cursor c{(uint8_t*) base};    b.R = c.take<float>((uint64_t) g.hc * g.n_embd);    b.mixed = c.take<float>((uint64_t) g.n_embd);    b.block_out = c.take<float>((uint64_t) g.n_embd);    b.inject = c.take<float>((uint64_t) g.hc);    b.inject2 = c.take<float>((uint64_t) g.hc);    b.gr_rs = c.take<float>((uint64_t) g.hc);    b.head_q8k = c.take_bytes(q8k_bytes(g.n_embd));    uint8_t* grw = c.take_bytes(strata::kernels::gr_workspace_bytes(s));    strata::kernels::gr_workspace_init(s, grw, b.gr);    return c.used;}
+uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b) {    const strata::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    Cursor c{(uint8_t*) base};    b.R = c.take<float>(g.has_hc() ? (uint64_t) g.hc * g.n_embd : (uint64_t) g.n_embd);    b.mixed = c.take<float>((uint64_t) g.n_embd);    b.block_out = c.take<float>((uint64_t) g.n_embd);    b.inject = c.take<float>((uint64_t) g.hc);    b.inject2 = c.take<float>((uint64_t) g.hc);    b.gr_rs = c.take<float>((uint64_t) g.hc);    b.head_q8k = c.take_bytes(q8k_bytes(g.n_embd));    uint8_t* grw = c.take_bytes(strata::kernels::gr_workspace_bytes(s));    strata::kernels::gr_workspace_init(s, grw, b.gr);    return c.used;}
 // ---- THE HALF-LEVEL C1 ORACLE.  `dump` is a HOST buffer of `2 * n_embd + 2 * hc + n_head * head_dim` floats
 // per layer; this enqueues one slice of it as a device-to-host copy.  **IT RUNS INSIDE THE CAPTURE**, which is
 // the point: the copy becomes a node of that layer's graph and replays with it, so the layer functions stay one
@@ -1192,8 +1195,12 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
     bool pending_ffn = fused && layer > 0 && !strata::kernels::cvec().covers(layer - 1);
     if (ple != nullptr && ple->ready() && layer == 1 && (half == 0 || half == 1)) {
         if (pending_ffn) {
+            // No hyper-connection: same plain add as everywhere else.
+            if (!g.has_hc()) strata::kernels::add_inplace(bb.R, bb.block_out, g.n_embd, stream);
+            else {
             const strata::kernels::GrShapes gs0{g.n_embd, g.hc, g.hc_lr};
             gr_write(bb.R, bb.block_out, bb.inject2, gs0, bb.R, stream);
+            }
             pending_ffn = false;
         }
         const int64_t hcd = strata::kernels::NG_HC_DIM;
@@ -1229,7 +1236,23 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
     const bool qsa = is_qsa_layer(g, layer);    const LayerView v(tables, layer);    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
 // ---- the two halves' GR tensors.  Both halves have the same four names with a different prefix, and the
 // prefix is the ONLY thing that distinguishes them - so it is built rather than written twice.
-const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
+//
+// **A PACK WITH NO `hc_*` IS NOT A SMALLER HYPER-CONNECTION, IT IS A PLAIN TRANSFORMER BLOCK** (Qwen3.6-35B,
+// Qwen3.8-27B).  The two roles `hc_*` plays - the pre-norm feeding the mixer, and the gated write-back - are
+// taken over by the ordinary `input_layernorm` / `post_attention_layernorm`, and the residual is a plain add.
+//
+// This is NOT the same as running the existing kernel with hc = 0.  `gr_parity.cpp`'s oracle divides by `hc`
+// in TWO places, so hc = 0 gives `mixed = 0/0` and `w[c] = 2*sigmoid(inject/0)`: NaN, not a plain residual,
+// and no error.  (The `2*sigmoid` is centred on 1, so a ZERO injection is a plain add - but the injection is
+// `bf16(xn) @ w_inject.T` against weights that do not exist here, not zero.)
+//
+// So the degenerate case is two calls that already exist: `rms_norm_weighted` for the norm, `add_inplace`
+// for the residual.  No new kernel, and `bb.R` is `n_embd` wide instead of `hc * n_embd`.
+const bool use_hc = g.has_hc();
+const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        if (!use_hc) {            // input_layernorm / post_attention_layernorm, in the same half order as `pre`.
+            const std::string n0 = h == 0 ? "input_layernorm.weight" : "post_attention_layernorm.weight";
+            w_norm[h] = v.get(n0.c_str());
+            if (!w_norm[h] || w_norm[h]->kind != WeightKind::F32) {                err = v.name(n0.c_str()) + (w_norm[h] ? "is not F32" : " is missing");                return false;            }            w_down[h] = w_up[h] = w_inject[h] = nullptr;            continue;        }        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
 // The GR weights are BF16 and the arena holds them re-rounded to 2 B/elem.  `gr_read` wants exactly
 // that; handing it f32 bytes would walk 2x the tensor inside the arena without faulting.
 if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||            w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }
@@ -1252,6 +1275,13 @@ st_begin(layer, 0, stream);
         fa.w_up = (const uint16_t*) w_up[0]->data; fa.w_inject = (const uint16_t*) w_inject[0]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
+    } else if (!use_hc) {
+    // No hyper-connection: the mixer IS the input_layernorm, and `inject` stays zero so the
+    // `block_layer_post` gate degenerates to weight 1.  Copy first, normalise the copy IN PLACE: `rms_norm_weighted`
+    // is in-place, and `R` is the residual this block has not written back to yet - normalising it would destroy
+    // the very thing the next stage adds to.  (gr_read never touches R for the same reason.)
+    strata::kernels::copy_from_mapped(bb.mixed, R, g.n_embd, stream);
+    strata::kernels::rms_norm_weighted(bb.mixed, (const float*) w_norm[0]->data, 1, g.n_embd, RMS_EPS, stream);
     } else {
     gr_read(R, (const float*) w_norm[0]->data, (const uint16_t*) w_down[0]->data,            (const uint16_t*) w_up[0]->data, (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
@@ -1259,7 +1289,11 @@ st_begin(layer, 0, stream);
     if (run1) {
     st_begin(layer, 1, stream);    if (qsa) {        if (!qsa_layer(tables, g, layer, pos, pos_base, qst, qb, bb.mixed, bb.block_out, stream, err,                            bb.dump))            return false;    } else {        if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;    }    st_end(layer, 1, stream);    dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);        }
     if (run2) {
-    st_begin(layer, 2, stream);    if (!fused) gr_write(R, bb.block_out, bb.inject, gs, R, stream);    st_end(layer, 2, stream);
+    st_begin(layer, 2, stream);    if (!fused && use_hc) gr_write(R, bb.block_out, bb.inject, gs, R, stream);
+    // No hyper-connection: a plain residual add.  `add_inplace` is element-wise `dst[i] += src[i]`, so
+    // dst == src is safe (each thread owns one i) - the in-place `R += R + block_out` is exactly the
+    // ordinary Transformer residual.  This is where the `2*sigmoid` gate would be; it is 1 by construction.
+    else if (!fused) strata::kernels::add_inplace(R, bb.block_out, g.n_embd, stream);    st_end(layer, 2, stream);
 // ---- half 2, UP TO AND INCLUDING THE ROUTER.  `gr_read` leaves the normed activation in `bb.mixed` and
 // the per-stream injection in `bb.inject`, and BOTH must survive until `block_layer_post` runs - which is
 // the contract the two functions have with each other and with the host loop's ordering.
@@ -1275,6 +1309,10 @@ st_begin(layer, 3, stream);
         fa.w_up = (const uint16_t*) w_up[1]->data; fa.w_inject = (const uint16_t*) w_inject[1]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
+    } else if (!use_hc) {
+    // The FFN front is `post_attention_layernorm`, same shape as the attention one.
+    strata::kernels::copy_from_mapped(bb.mixed, R, g.n_embd, stream);
+    strata::kernels::rms_norm_weighted(bb.mixed, (const float*) w_norm[1]->data, 1, g.n_embd, RMS_EPS, stream);
     } else {
     gr_read(R, (const float*) w_norm[1]->data, (const uint16_t*) w_down[1]->data,            (const uint16_t*) w_up[1]->data, (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
@@ -1326,7 +1364,13 @@ st_begin(layer, 5, stream);
     st_end(layer, 5, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
     const bool steer = strata::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write
     try {
-        if (!(g_fused_gr && strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr))) {
+        // No hyper-connection: the FFN write-back is a plain residual add, and the control vector scales the
+        // n_embd-wide R (not a `hc * n_embd` stack).  `cvec` is a Flash-Next feature (it scales the streams
+        // through the `2*sigmoid` gate), so a plain block has none - `steer` is already false there.
+        if (!g.has_hc()) {
+            strata::kernels::add_inplace(bb.R, bb.block_out, g.n_embd, stream);
+            if (steer) strata::kernels::cvec_apply(bb.R, layer, 1, g.n_embd, nullptr, 0, nullptr, 0, false, stream);
+        } else if (!(g_fused_gr && strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr))) {
             gr_write(bb.R, bb.block_out, bb.inject, gs, bb.R, stream);
             if (steer) strata::kernels::cvec_apply(bb.R, layer, 1, g.hc * g.n_embd, nullptr, 0, nullptr, 0, false, stream);
         } else if (layer == g.n_layers - 1) {
