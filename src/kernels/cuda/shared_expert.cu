@@ -341,6 +341,22 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // the per-token scalar gate, then the multiply.  Note the gate is computed from `x`, the ORIGINAL hidden
     // state, not from anything the expert produced. The historical branch uses BF16-rounded inputs; the
     // native branch uses the pinned CUDA FP32 activation contract.
+    //
+    // **A DENSE BLOCK HAS NO `gate_inp_shexp` AND IS NOT MISSING A SCALAR GATE.**  `ffn_gate_inp_shexp` is a
+    // Qwen4-Exp shared-expert feature: a (n_embd,) vector producing ONE sigmoid per token that scales the whole
+    // expert output.  A plain SwiGLU FFN (Qwen3.8-27B) has no such tensor - its three matrices are all there is.
+    // So a null `gate_inp_bf16` means "no scalar gate", i.e. `out` is already the answer.  Without this the kernel
+    // would dereference null inside a GEMV.
+    if (gate_inp_bf16 == nullptr) {
+        if (stream == nullptr) {
+            const cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "shared_expert: %s\n", cudaGetErrorString(e));
+                std::exit(1);
+            }
+        }
+        return;
+    }
     // `<<<1, 256>>>`: one block, because the output is ONE scalar and a second block would only add a global
     // round trip.  256 threads is the reduction's width, not the problem's size.
     if (use_native) {

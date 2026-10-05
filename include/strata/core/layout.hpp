@@ -57,6 +57,26 @@ struct ModelGeometry {
     int64_t n_expert = 512;
     int64_t n_ff = 640;
 
+    // **A DENSE FFN'S HIDDEN EXPANSION, WHICH IS NOT `n_ff`.**  In a MoE pack `n_ff` is the PER-EXPERT width
+    // (640) and a layer's k selected experts each use it.  A dense pack's three matrices are the whole hidden
+    // expansion instead: Qwen3.8-27B's `intermediate_size` is 17408, 27x.  Reusing `n_ff` for both would size the
+    // FFN 27x wrong - a finite, plausible, completely wrong answer, since the gate GEMV would read 17408 rows
+    // out of a 640-row matrix and find the rest inside whatever follows it in the arena.
+    // Zero means "no dense FFN" (a MoE pack); `ffn_dense` is only reachable when has_moe() is false.
+    int64_t dense_ffn = 0;
+
+    /// **THE WIDTH EVERY FFN BUFFER FOLLOWS: the gate/up/down expansion, and the shared expert's scratch.**
+    ///
+    /// Both the projection width and `shared_expert_scratch_bytes` are as wide as the FFN's hidden expansion, so
+    /// they take the same number.  A MoE pack's is `n_ff` (640, per expert); a dense pack's is `dense_ffn`
+    /// (17408).  Sizing a dense FFN's scratch with `n_ff` overruns it 27x - the gate GEMV writes n_ff floats into
+    /// a region meant for 640 of them, straight through the up/down buffers.  Silent: no bounds check, no crash,
+    /// just a corrupted neighbouring buffer.
+    ///
+    /// This is ONE function, here, because a second copy in layer.cpp (or in a test) is a second thing to
+    /// disagree with - and a stale copy in a test asserts nothing at all.
+    int64_t ffn_width() const { return has_moe() ? n_ff : dense_ffn; }
+
     /// WHICH SUBSYSTEMS THIS PACK HAS, derived from the numbers above instead of stored beside them.
     /// A second set of flags is a second thing to disagree with the geometry, which is what this struct
     /// exists to prevent - so each is a comparison against a field the pack already pins.

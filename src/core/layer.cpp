@@ -344,14 +344,14 @@ uint64_t moe_buffers_bytes(const ModelGeometry& g, int64_t k) {    const uint64_
 // weights
 (uint64_t) g.n_embd * 4,
 // shared
-strata::kernels::shared_expert_scratch_bytes(g.n_ff),
+strata::kernels::shared_expert_scratch_bytes(g.ffn_width()),
 // the shared expert's own scratch
 (uint64_t) (g.n_embd / 32) * 34,
 // x_q8_0
 q8k_bytes(g.n_embd),
 // x_q8k
 };    uint64_t total = 0;    for (uint64_t v : parts) total += (v + 15) & ~(uint64_t) 15;    return total;}
-uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuffers& b) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2, (uint64_t) g.n_embd * 2, (uint64_t) g.n_expert * 4,        (uint64_t) k * 4, (uint64_t) k * 4, (uint64_t) g.n_embd * 4,        strata::kernels::shared_expert_scratch_bytes(g.n_ff),        (uint64_t) (g.n_embd / 32) * 34, q8k_bytes(g.n_embd),    };    uint8_t* p = (uint8_t*) base;    void* ptr[9];    uint64_t total = 0;    for (int i = 0; i < 9; ++i) {        ptr[i] = p;        const uint64_t al = (parts[i] + 15) & ~(uint64_t) 15;        p += al;        total += al;    }    b.x_bf16 = (uint16_t*) ptr[0];    b.x_f16 = (uint16_t*) ptr[1];    b.logits = (float*) ptr[2];    b.ids = (int*) ptr[3];    b.weights = (float*) ptr[4];    b.shared = (float*) ptr[5];    b.sh_scratch = (float*) ptr[6];    b.x_q8_0 = (uint8_t*) ptr[7];    b.x_q8k = (uint8_t*) ptr[8];    return total;}
+uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuffers& b) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2, (uint64_t) g.n_embd * 2, (uint64_t) g.n_expert * 4,        (uint64_t) k * 4, (uint64_t) k * 4, (uint64_t) g.n_embd * 4,        strata::kernels::shared_expert_scratch_bytes(g.ffn_width()),        (uint64_t) (g.n_embd / 32) * 34, q8k_bytes(g.n_embd),    };    uint8_t* p = (uint8_t*) base;    void* ptr[9];    uint64_t total = 0;    for (int i = 0; i < 9; ++i) {        ptr[i] = p;        const uint64_t al = (parts[i] + 15) & ~(uint64_t) 15;        p += al;        total += al;    }    b.x_bf16 = (uint16_t*) ptr[0];    b.x_f16 = (uint16_t*) ptr[1];    b.logits = (float*) ptr[2];    b.ids = (int*) ptr[3];    b.weights = (float*) ptr[4];    b.shared = (float*) ptr[5];    b.sh_scratch = (float*) ptr[6];    b.x_q8_0 = (uint8_t*) ptr[7];    b.x_q8k = (uint8_t*) ptr[8];    return total;}
 bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,               const float* x, void* stream, std::string& err, const Doorbell* db) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_router = v.get("ffn_gate_inp.weight");    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
 // ---- the router's activation.  The router's weight is BF16 and that is the one `ref/moe.py` singles out.
 if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
@@ -446,6 +446,59 @@ f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
                       g.n_embd, g.n_ff, /*tpr=*/32, stream, x, &native);
     } catch (const std::exception& error) {
         err = v.name("shared_expert") + ": " + error.what();
+        return false;
+    }
+    return true;
+}
+// **A DENSE FFN IS THE SHARED EXPERT WITH DIFFERENT NAMES AND NO SCALAR GATE** (Qwen3.8-27B).
+//
+// This is deliberately the same kernel and the same call, not a parallel implementation.  `shared_expert` is
+// already a plain SwiGLU over arbitrary (n_embd, n_ff) - the `tpr` argument is a `threads_per_row` performance
+// knob for `s2_gemv_q8`, not a geometry constraint, and `gate_inp_bf16 == nullptr` now means "no scalar gate".
+// The only real differences are the tensor names and the absent `ffn_gate_inp_shexp`.
+//
+// `n_ff` comes from the caller, not from `g`: Flash-Next's `n_ff` is the PER-EXPERT width (640) while a dense
+// block's is the whole hidden expansion (17408), and the two must not be confused.
+bool ffn_dense(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t n_ff,
+               const MoEBuffers& b, const float* x, void* stream, std::string& err) {
+    using namespace strata::kernels;
+    const LayerView v(tables, layer);
+    const WeightRef* w_gate = v.get("mlp.gate_proj.weight");
+    const WeightRef* w_up = v.get("mlp.up_proj.weight");
+    const WeightRef* w_down = v.get("mlp.down_proj.weight");
+    const char* missing = !w_gate ? "mlp.gate_proj.weight" : !w_up ? "mlp.up_proj.weight"
+                        : !w_down ? "mlp.down_proj.weight" : nullptr;
+    if (missing) { err = v.name(missing) + " is missing"; return false; }
+    SForm f_gate, f_up, f_down;
+    if (!sform_of(*w_gate, f_gate, v.name("mlp.gate_proj.weight"), err)) return false;
+    if (!sform_of(*w_up, f_up, v.name("mlp.up_proj.weight"), err)) return false;
+    if (!sform_of(*w_down, f_down, v.name("mlp.down_proj.weight"), err)) return false;
+    Planes p_gate, p_up, p_down;
+    if (!plane_ptrs(*w_gate, v.name("mlp.gate_proj.weight"), p_gate, err)) return false;
+    if (!plane_ptrs(*w_up, v.name("mlp.up_proj.weight"), p_up, err)) return false;
+    if (!plane_ptrs(*w_down, v.name("mlp.down_proj.weight"), p_down, err)) return false;
+    f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
+    // Same reasoning as the shared expert: the three weights are not one family, so both quantized images of
+    // the activation are produced and each projection takes the one its own form asks for.
+    if (!w_gate->native_data || !w_up->native_data) {
+        quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
+        quantize_q8_0(x, b.x_q8_0, g.n_embd, stream);
+    }
+    NativeSharedWeights native;
+    native.gate_type = w_gate->native_type; native.gate_data = w_gate->native_data;
+    native.up_type = w_up->native_type; native.up_data = w_up->native_data;
+    native.down_type = w_down->native_type; native.down_data = w_down->native_data;
+    native.q8_1 = w_gate->native_q8_1 ? w_gate->native_q8_1
+                  : w_up->native_q8_1 ? w_up->native_q8_1 : w_down->native_q8_1;
+    try {
+        // `gate_inp = nullptr`: no per-token scalar gate.  `tpr` 32 is the shared expert's value and is a
+        // threads-per-row tile, not a width.
+        shared_expert(b.x_q8_0, b.x_q8k, b.x_bf16, f_gate, p_gate.codes, p_gate.scales, p_gate.offset,
+                      f_up, p_up.codes, p_up.scales, p_up.offset, f_down, p_down.codes, p_down.scales,
+                      p_down.offset, nullptr, b.sh_scratch, b.shared, g.n_embd, n_ff, /*tpr=*/32, stream, x,
+                      &native);
+    } catch (const std::exception& error) {
+        err = v.name("mlp") + ": " + error.what();
         return false;
     }
     return true;
@@ -1318,9 +1371,17 @@ st_begin(layer, 3, stream);
     }
     st_end(layer, 3, stream);        }
     if (run4) {
+    // A DENSE BLOCK HAS NO ROUTER.  `moe_route` reads `ffn_gate_inpp_shexp` and returns k expert ids; a plain
+    // SwiGLU FFN has neither.  `ffn_dense` already writes its result into `mb.shared`, which is exactly where
+    // the MoE path's shared-expert output lands, so stage 5 only has to publish it instead of combining k parts.
+    if (!g.has_moe()) {
+        if (!ffn_dense(tables, g, layer, g.ffn_width(), mb, bb.mixed, stream, err)) return false;
+        st_end(layer, 4, stream);
+    } else {
     st_begin(layer, 4, stream);    {        const bool ok = moe_route(tables, g, layer, k, mb, bb.mixed, stream, err, db);        st_end(layer, 4, stream);        if (!ok) return false;    }
     // Plan v0.3 P3: after the ring, so the GPU computes the shared expert while the host runs the pool.
     if (g_shared_early && !moe_shared(tables, g, layer, mb, bb.mixed, stream, err)) return false;
+    }
     }
     // Every stage this call was asked to run has run.  There is no other way out: the old `return ok;`
     // lived inside the stage-4 block and restructuring that left the function with no return at all.
@@ -1359,8 +1420,13 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
 // `bb.mixed` and `bb.inject` are what `block_layer_pre` left, and NOTHING between the two calls may touch
 // them - that is what makes `post[l]` safe to launch after the host has run the pool.
 st_begin(layer, 5, stream);
-    if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
-                       : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err)) return false;
+    // Dense: `ffn_dense` already computed the whole FFN into `mb.shared` at stage 4 - there are no k parts to
+    // combine and no expert weights to apply, so the MoE combine (a weighted sum plus the shared term) would
+    // read a `parts` buffer that was never written.  Publish `shared` as `block_out` and stop.
+    if (!g.has_moe()) {
+        strata::kernels::copy_from_mapped(bb.block_out, mb.shared, g.n_embd, stream);
+    } else if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
+                              : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err)) return false;
     st_end(layer, 5, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
     const bool steer = strata::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write
     try {
