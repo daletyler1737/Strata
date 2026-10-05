@@ -12,6 +12,7 @@
 // specification, and fitting formulas to it would hide exactly the errors this is supposed to catch.
 #pragma once
 
+#include "strata/core/layout.hpp"   // for the `ModelGeometry` `geometry_of` below derives from
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -58,6 +59,21 @@ struct Geometry {
     int n_gdn_layers() const { return n_layers - n_qsa_layers; }
 };
 
+/// `plan::Geometry` from a loaded `ModelGeometry` - the third hand-copy of this arithmetic (after
+/// `QsaShapes` and `ModelGeometry` itself) becomes a derivation.  ponytail: `plan.hpp` includes
+/// `layout.hpp`, which is why it can be a conversion and not a struct the caller fills in by hand -
+/// `plan_main.cpp` and `device_main.cpp` both passed `Geometry{}` and so silently planned EVERY model as
+/// Flash-Next, including a 27B whose indexer term is zero and whose expert count is 16x smaller.
+inline Geometry geometry_of(const core::ModelGeometry& g) {
+    Geometry p;
+    p.n_layers = (int) g.n_layers;
+    p.n_qsa_layers = (int) g.n_qsa_layers();
+    p.n_kv_heads = (int) g.n_head_kv;
+    p.head_dim = (int) g.head_dim;
+    p.indexer_key_dim = (int) g.idx_key_dim;   // 0 for a pack with no indexer -> has_indexer() false
+    return p;
+}
+
 // ---- byte costs ------------------------------------------------------------
 struct Costs {
     uint64_t expert_blob = 1382400; // one expert's gate_up+down, codes and scales (architecture §3.2)
@@ -94,6 +110,10 @@ inline uint64_t kv_bytes_per_token(const Geometry& g) {
     const uint64_t per_layer = kv_elems * 1 + kv_scales;              // INT8: one byte per element
     // indexer: ONE cached key per block, `idx_dim` wide, SHARED across the query heads.  See the note on
     // `indexer_key_heads` above - this term has been wrong in both directions and the derivation is why.
+    //
+    // NO GUARD NEEDED for a pack with no indexer: `geometry_of` gives it `idx_dim = 0`, and `1 * 0 / 4` is
+    // already 0.  A guard would be a second thing to keep in step with the width.  (What actually mattered was
+    // that both callers passed `Geometry{}` - Flash-Next's width - instead of the loaded geometry.)
     const uint64_t idx_layer =
         (uint64_t) g.indexer_key_heads * (uint64_t) g.indexer_key_dim / (uint64_t) g.qsa_block;
     return (uint64_t)g.n_qsa_layers * (per_layer + idx_layer);
