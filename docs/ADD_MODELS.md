@@ -79,18 +79,48 @@ GDN 线性注意力 + 每 4 层一次全注意力 + MTP 投机解码 —— 这�
 
 ## 3. 分阶段改造
 
-### 阶段 0：几何参数化（半天，机械）
+### 阶段 0：几何参数化（半天，机械）— **已完成**
 
-`ModelGeometry` 已经是 struct，`check_layer()` 已经按它断言。所以：
+`ModelGeometry` 本来就是 struct，`check_layer()` 本来就按它断言。所以：
 
 ```bash
-python tools/geometry_from_config.py bench/q38_27b.json   # 打印可直接粘贴的 C++ 块 + 待办清单
+python tools/geometry_from_config.py bench/q38_27b.json   # 打印可粘贴的 C++ 块 + 待办清单
 python tools/geometry_from_config.py bench/q36_35b.json
 ```
 
-改 `include/strata/core/layout.hpp` 默认值 + 把 `24576` 改成 `g.n_layers * g.n_expert`。
+**实际改动**（commit `3b8dbea`，2026-10-05）：
 
-**但这不是「加个模型」** —— `ModelGeometry` 只是契约，kernel 还得能用这些数字算。
+| 文件 | 改了什么 |
+|---|---|
+| `include/strata/core/layout.hpp` | 加 `ple_ngram_size`（默认 3）+ `has_moe()` / `has_hc()` / `has_indexer()` / `has_ple()` / `n_experts_total()`。四个谓词全是对既有字段的比较 —— 不引入第二套能和几何不一致的状态 |
+| `src/core/layout.cpp` | `Want2`/`Want1` 的两个 bool（`qsa_only`,`gdn_only`）换成两个独立门 `WantSub`（pack 有没有这个子系统）× `WantLayer`（这层是不是这种）。**indexer 需要两个门同时开**，原来只有层级门 |
+| `include/strata/core/weights.hpp` | `find()` 移到头文件 inline（3 行）；加 `insert()` 给测试搭表 |
+| `src/core/weights.cpp` | 删掉搬走的 `find()` |
+| `tests/core/layout_subsystem_test.cpp` | 新增：三种架构各一份手搭 `WeightTable`，纯 CPU |
+
+验证：`g++ -std=c++17 -Wall -Wextra` 编译无警告 → `all cases pass`；
+**7 处变异测试 7/7 被抓住**（`has_indexer`/`has_moe`/`has_ple` 恒真、`n_experts_total` 写死 24576、
+indexer 丢层级门、hc 丢子系统门、MoE router 丢子系统门）。
+
+关键防退化断言（**闸门不能只是不再发问**）：
+- qwen3.6-35b 去掉 router → `check_all` 必须**仍然拒绝**
+- 稠密 pack 把 `n_expert` 改成 8 → `check_all` 必须**仍然拒绝**
+
+编译方式（无需 CUDA，本机 Windows 无 nvcc，走 WSL）：
+
+```bash
+ln -sfn "/mnt/e/zip/agent file big/01_项目代码/Strata" /opt/src/strata   # 中文路径过 WSL 会被编码吃掉
+wsl -d debian-bookworm -- bash -c 'cd /opt/src/strata && \
+  g++ -std=c++17 -Iinclude -o /tmp/t tests/core/layout_subsystem_test.cpp src/core/layout.cpp && /tmp/t'
+```
+
+> ponytail: 引擎里没有引入 JSON 解析器 —— `weights.hpp` 头部明确禁掉了（"a JSON parser in the engine
+> would be a new, unaudited component whose failure mode is a wrong byte offset"）。几何仍由几何字段表达。
+
+> **阶段 0 里我说错的一条**：之前报告「`24576` 有 2 处硬编码要改成 `n_layers*n_expert`」—— 实际核查，
+> `generate.cpp:3572` 是注释，`decode_cluster_parity.cpp:412` 是 argmax 测试的词表，**都不是硬编码**。
+> 真正的专家总数计算在 `expert_source.cpp` 等处已经走 `g.n_expert`。已加 `n_experts_total()` 作为
+> 唯一的推导入口，替换散落的字面量。
 
 ### 阶段 1：干掉 QSA indexer（2–3 天）
 
