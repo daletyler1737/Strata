@@ -92,3 +92,8 @@ WSL 继承 Windows 的 PATH（含空格和括号），任何内联 `bash -c '...
 
 已经踩过的具体现场：Qwen3.6-35B-A3B 的 IQ2_XXS（9.94 GB）从 hf-mirror 下载时，
 目录名乱码导致文件落在错误路径，中途还要 `mv` 回正确位置再续传。
+
+- **后台任务默认不是 WSL。** `terminal(background=True)` 起的是 Windows shell，`python3`、`cmake`、
+  `/usr/bin/time` 全都不在它的 PATH 里，报的是 `command not found`（rc=127），不是"文件缺失"。
+  把命令写成脚本，再 `wsl.exe -d <distro> -- bash /mnt/c/.../script.sh`。
+- **WSL 里没有 `time`。** `/usr/bin/time` 不在，用 `date +%s` 前后包一下算耗时。
