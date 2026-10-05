@@ -171,47 +171,68 @@ commit `9e1a9fd`。147 插入 / 90 删除。
 **省的部分**：`check_layer` 里那些「indexer.head_count 计数错」的注释说明这块代码本身有历史 bug，
 少一套少一份风险。
 
-### 阶段 2：干掉 gated residual（1 天）— **一半完成**
+### 阶段 2：干掉 gated residual（1 天）— **完成**
 
-拆成两半：
+`888d8bc`（`06a0240` 预算 + `888d8bc` kernel 路径）
 
-**已完成：显存预算（commit `06a0240`，+20 行）**
+**我上一轮写在本文档里的推导是错的，已更正。** 当时写"hc=1 时逐流 RMSNorm + mean 塌缩成一次
+普通 RMSNorm，`2*sigmoid` 门恒等于 1，所以 `gr_write` 塌缩成 `R += block_out`"——听起来自洽，
+但那是**推出来的**，不是读出来的。读 `gr_parity.cpp:70` 的 CPU oracle 才看清：它有**两处除以 hc**：
 
-`plan::Geometry` 是同一段算术的**第三份手抄**（前两份是 `QsaShapes`、`ModelGeometry`），
-而 `plan_main.cpp` 和 `device_main.cpp` **都直接传 `Geometry{}`** —— 即每个模型都按 Flash-Next 算预算。
+```cpp
+lo[k]    = silu(p / hc)          // L104
+mixed[d] = m / hc                // L125
+w[c]     = 2*sigmoid(inject[c] / hc)   // gr.hpp 文档，gr_write
+```
 
-新增 `geometry_of(core::ModelGeometry)` 转换，32K 上下文下：
+所以 `hc = 0` 给的是 `mixed = 0/0` 和 `2*sigmoid(inject/0)` —— **NaN，不是普通残差**，
+而且不报错。`2*sigmoid` 确实以 1 为中心（零注入 = 纯加法），但注入是 `bf16(xn) @ w_inject.T`
+对着一组**并不存在**的权重，不是零。hc=1 也不会塌缩成上面那个样子。
 
-| | Flash-Next | Qwen3.8-27B |
+**正确的退化形态来自 manifest，不是推导。** 查 Qwen3.6-35B 的 `model.safetensors.index.json`，
+`layers.0` 的张量里有：
+
+```
+input_layernorm.weight
+post_attention_layernorm.weight
+```
+
+没有 `hc_*`。而 Flash-Next 里正是 `hc_attn_norm` / `hc_ffn_norm` 扮演这两个角色。所以无 hc 时：
+
+| | 有 hc（Flash-Next） | 无 hc（35B / 27B） |
 |---|---|---|
-| KV + indexer | 408 MB | **1056 MB** |
-| recurrent state | 112 MB | **149 MB** |
+| mixer | `hc_*_norm` 归一化 + 门控混合 | `input_layernorm` / `post_attention_layernorm` |
+| residual | `hc * n_embd` 的栈 | `n_embd` 的向量 |
+| 写回 | `R + block_out * 2*sigmoid(inject/hc)` | `R + block_out` |
 
-即原来的预算把一个 27B 的 KV **低估了 2.6 倍** —— 规划器返回它兑现不了的 plan，
-失败落在 token 4000 而不是启动时。这正是 `DoesNotClose` 存在的意义。
+**不需要新 kernel，两个已存在的调用就够：**
 
-> **删掉了一个自己写出来的多余东西**：一开始给 `idx_layer` 加了 `g.has_indexer() ? ... : 0` 门，
-> 变异测试立刻发现是死代码 —— `geometry_of` 给出 `idx_dim = 0`，`1 * 0 / 4` 本来就是 0。
-> 门等于多加一个要和宽度保持一致的东西，没有收益。
+```cpp
+copy_from_mapped(bb.mixed, R, g.n_embd, stream);
+rms_norm_weighted(bb.mixed, w_norm, 1, g.n_embd, RMS_EPS, stream);   // mixer
+strata::kernels::add_inplace(bb.R, bb.block_out, g.n_embd, stream);    // 残差
+```
 
-> 没改 `plan_main.cpp` / `device_main.cpp`：它们是独立探针，根本不加载模型，`Geometry{}` 是唯一可选项，
-> 改名成 `flash_next()` 只是换个名字，不解决问题。真正该做的是 `generate.cpp` 走 `geometry_of(g)`。
+`add_inplace` 是逐元素 `dst[i] += src[i]`，所以 `dst == src` 安全（每个线程只碰自己的 i）——
+这正是原地 `R += block_out`。
 
-测试 `tests/core/plan_geometry_test.cpp`，纯 CPU，14 断言。`src/plan/plan_main.cpp` 编译通过。
-6 处变异全 `exit=1`。
+> **第一版漏了缓冲区宽度，那是最严重的一处。** `b.R` 按 `g.hc * g.n_embd` 分配，`hc = 0` 时是
+> **0 floats** —— 而无 hc 的块仍然要做 `R += block_out`，整个普通 Transformer 残差写在缓冲区
+> 起点之外。不崩溃，只是静默损坏。`block_buffers_bytes` 和 `block_buffers_init` 都改成 `has_hc()`
+> 三元。判据是 `has_hc()` 而不是 `hc != 0`：那才是加载器检查过的东西，且 `hc = 1` 仍然是一栈。
 
-**未完成：hc kernel 路径**
+> 踩到自己的两个错：① 先写成 `rms_norm_weighted(R, ...)` 就地归一化 `R` —— 那会毁掉本块
+> 还没写回的残差；`gr_read` 从不改 `R` 正是这个原因。② 裸调 `add_inplace` / `rms_norm_weighted`
+> 编译不过 —— 它们在 `strata::kernels`，匿名 namespace 里有 using 声明，`strata::core` 里没有。
 
-`gr.cu`(77 命中) / `fused_gr.cu`(40) / `gr_parity.cpp`(65) / `include/strata/kernels/gr.hpp`
-对这两个 pack 是死代码。**本机没有 nvcc（Windows 和 WSL 都没有），编不了。**
+测试 `tests/kernels/gr_degenerate_test.cpp`（纯 CPU，20 断言）。**变异 8/8 被抓住**，
+包括"恢复成 `g.hc * g.n_embd`"（我实际写出去的那个 bug）。
+完整 CUDA 构建 225/225 通过（nvcc 12.9, sm_86），四个 CPU 测试全绿。
 
-> ponytail: 无 `hc_*` 时 `gr_read` 退化成什么？读 `gr_parity.cpp:70` 的 CPU oracle —— `hc=1` 时
-> 逐流 RMSNorm + `mean` over streams 塌缩成一次普通 RMSNorm，`inject` 宽度为 1 且 `2*sigmoid` 门恒等于 1，
-> 所以 `gr_write` 塌缩成 `R += block_out`。**理论上不需要新 kernel**，但 `gr_workspace_init` 要求
-> DEVICE 指针且不校验、现有 elementwise.hpp 里没有 f32 拷贝原语，得先确认 aliasing 行为。
+> 早先记的"本机没有 nvcc，编不了"已作废：见 [BUILD_ENV.md](BUILD_ENV.md)。WSL + CUDA 12.9 已装好并实测。
 
 注意：`gr_*` 在 `prefill/kernels.cu` 里也占 10 处、`ple.cu` 占 45 处 —— 说明 **PLE 和 GR 在
-prompt 路径里是耦合的**，删 GR 要连带看 PLE。
+prompt 路径里是耦合的**，动 GR 要连带看 PLE。
 
 ### 阶段 3：MoE 参数化（Qwen3.6-35B-A3B 专用，3–5 天）
 
