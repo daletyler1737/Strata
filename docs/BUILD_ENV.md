@@ -1,0 +1,59 @@
+# 本机构建环境
+
+结论：**WSL + apt 装的 CUDA 12.9**。已实测 nvcc 编出 sm_86 cubin 并在 RTX 3060 Laptop 上跑出正确结果。
+
+## 为什么不是 Docker
+
+- 项目只发 Windows 预编译引擎（`strata-windows-x64-cuda12.zip`，v0.1.39）。
+  `nvidia/cuda` 是 Linux 镜像，编出的 `.so` 是 Linux ELF，在这台机器上跑不了 —— 要 Docker 就得整台搬到 Linux。
+- 本机 Docker daemon 当时也没跑（`npipe:////./pipe/dockerDesktopLinuxEngine` 不存在）。
+
+## 为什么不是 venv
+
+venv 隔离 Python。`nvcc` 是 C++/CUDA 编译器，与 Python 无关。venv 在这道题上帮不上任何忙。
+
+## 为什么选 12.9 而不是 13.x
+
+`setup.py:2150` 的门槛是 `need_cuda = (13,0) if max(archs) >= 120 else (12,0)`。
+RTX 3060 Laptop 是 sm_86 → 只要 **12.0**。13.x 只有 sm_120（RTX 50）才需要。
+
+驱动 615.78.02，CUDA 12.9 要求 525，够。
+
+## 装了什么（12 个包，没有驱动没有 dkms）
+
+```
+cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcublas-dev-12-9 cuda-cccl-12-9
+  -> cuda-crt-12-9 cuda-cudart-12-9 cuda-driver-dev-12-9 cuda-nvvm-12-9
+     cuda-toolkit-12-9-config-common cuda-toolkit-12-config-common
+     cuda-toolkit-config-common libcublas-12-9
+```
+
+```bash
+# keyring 装一次，之后 apt 自己管；不用 trusted=yes 绕签名
+cd /tmp && curl -sSLO https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcublas-dev-12-9 cuda-cccl-12-9 cmake ninja-build
+```
+
+`--no-install-recommends` 是必须的：默认会拖进 `dkms` + `nvidia-installer-cleanup`，
+而 WSL 的内核模块由 Windows 驱动提供，dkms 装不了也没用。
+
+Debian 官方源只有 `nvidia-cuda-toolkit` 11.8 —— **不够**，必须走 NVIDIA 自己的 repo。
+
+## 用的时候
+
+```bash
+export PATH=/usr/local/cuda-12.9/bin:$PATH
+```
+
+WSL 继承 Windows 的 PATH（含空格和括号），任何内联 `bash -c '...'` 都会 syntax error。
+写脚本文件跑，别内联。
+
+源码路径：`/opt/src/strata` → `/mnt/e/zip/agent file big/01_项目代码/Strata`（ASCII symlink，绕开中文路径）。
+
+## 现状
+
+- nvcc 12.9.86 ✓ / cmake 3.25.1 ✓（要求 3.24）/ ninja 1.11.1 ✓ / g++ 12.2.0 ✓
+- `third_party/ggml` 空 —— llama.cpp 需按 `setup.py` 的 `LLAMA_CPP_COMMIT` 拉（GitHub 直连通，39.5 MB）
+- 完整 CMake 构建未跑
