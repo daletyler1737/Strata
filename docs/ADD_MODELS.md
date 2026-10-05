@@ -234,19 +234,83 @@ strata::kernels::add_inplace(bb.R, bb.block_out, g.n_embd, stream);    // 残差
 注意：`gr_*` 在 `prefill/kernels.cu` 里也占 10 处、`ple.cu` 占 45 处 —— 说明 **PLE 和 GR 在
 prompt 路径里是耦合的**，动 GR 要连带看 PLE。
 
-### 阶段 3：MoE 参数化（Qwen3.6-35B-A3B 专用，3–5 天）— 未开始
+### 阶段 3：MoE 参数化（Qwen3.6-35B-A3B 专用）— **代码完成，未做真实权重推理**
 
-Qwen3.6-35B-A3B 仍是 MoE（256 专家 / top-8 / n_ff=512），结构同族，改动相对小：
+#### 先纠正一个我一开始搞错的对比
 
-- `router_top10.cu` 的 top-10 假设要参数化（256 专家 top-8）。签名已有 `k` 参数，重点是 kernel 内部的 warp 布局
-- `s2_gemv` 系列（`s2_gemv.cu` / `s2_gemv_fast.cu` / `s2_gemv_q8.cu` / `s2_expert_grouped.cu`）是 Q2_0/IQ 的
-  专用 dequant+GEMV，n_ff 从 640 变 512 → 重新 tune tile
-- `expert_source.cpp`(148 命中) / `expert_cache.cpp` / `peer_experts.cpp` 的 expert 寻址是
-  `layer * 512 + expert` 的扁平索引 → 改成 `layer * n_expert + expert`
-- `prefill/moe_fused.cu` / `moe_mmq.cu` / `moe_fused_iq.cu` 的 group 尺寸要重算
-- `plan/plan.hpp` 显存预算：专家总数从 24576 降到 10240，**缓存能多装一倍专家 → 会更快**
+我先拿 safetensors 名字（`mlp.experts.gate_up_proj`、`mlp.gate.weight`）去比 Strata 期待的
+`ffn_gate_up_exps`、`ffn_gate_inp`，得出"张量命名完全不同，阶段 3 是一份重命名工程"。
 
-Qwen3.8-27B **没有 MoE**，走阶段 4。
+**这个对比本身是错的。** Strata 读的是 GGUF，不是 safetensors；而 llama.cpp 的 `qwen35moe` GGUF 里
+张量名**和 Flash-Next 完全一致**（`llama.cpp/src/models/qwen35moe.cpp` 里就是
+`ffn_gate_inp` / `ffn_gate_up_exps` / `ffn_down_exps` / `ffn_*_shexp`）—— 同一个 converter 血统。
+
+所以阶段 3 **不需要新 kernel、不需要重命名层**。真正要做的只有两件，都是"元数据"层面的。
+
+#### 1. 架构门槛
+
+`check_architecture` 只认 `qwen4exp`。加白名单 `qwen35moe`（`llama-arch.cpp` L41/L42 的字符串）。
+
+**键前缀必须跟着 arch 走。** 原来硬编码 `qwen4exp.` 前缀，所以一个 qwen35moe 文件会"成功"地
+读不到任何键，返回空 —— 每个字段都沿用 Flash-Next 的默认值。
+
+#### 2. 几何从文件读，不留编译期常量
+
+原来 `generate.cpp` 只读 `expert_count` 和 `expert_used_count`，`n_embd = 2560`、`n_layers = 48`、
+`n_head = 24` 全是常量。新增 `strata::read_geometry()`（在 reader 侧，因为 `layout.hpp` 不认识 GGUF）。
+
+**这个 bug 的形状是"静默"的**：arena 大 25% 仍然是个 arena，第一个症状是一个看起来合理的错数字，
+而不是拒绝。缺必需键现在报错，不默认；只有 `head_dim` 可选（按 llama.cpp 的规则推
+`n_embd / n_head`）。
+
+#### 顺手抓到的两个真 bug
+
+**(a) `Qwen4ExpGuard{}` 的默认值就是 Flash-Next 的形状**（48/2560/24/2）。`check_architecture(g)`
+无参调用会断言"这文件是 Flash-Next"—— 40 层的 qwen35moe 被拒为 `block_count = 40, expected 48`。
+一个给所有模型用的 guard 里塞某个模型的默认值，不是默认值，是假设。改成全 0 = presence-only。
+
+**(b) `read_geometry` 里 `head_dim` 没先清零。** `out` 带着 Flash-Next 的默认值进来，key_length
+缺失时 `head_dim` 留在 256，是正数，于是"键缺失"和"文件说 256"变成同一个数，推导分支永不执行，
+模型静默拿到 Flash-Next 的 head 宽度。先清零再读。
+
+#### 还有一个宽度陷阱
+
+文件里只有 shared expert 的 `expert_shared_feed_forward_length`（512），**路由专家宽度必须
+`512 / expert_used_count = 64`**（llama.cpp 就是这么算的）。直接拿 512 会让每个专家宽 8 倍。
+
+#### SSM 两个派生宽度
+
+`ssm_value_dim = state_size × v_heads`、`ssm_conv_channels = state_size × (2×k_heads + v_heads)`。
+两个家族都对得上：Flash-Next 128×48=6144 / 128×80=10240，Qwen3.6-35B 128×32=4096 / 128×64=8192。
+注意 conv 是 `2*k + v`：qwen35moe 里 `key_dim*2 + value_dim` 就是这么写的。
+
+#### 键名的教训
+
+我第一版写的 `hyper_connections` 是**猜的**，真名是 `hyper_connection.count` /
+`hyper_connection.low_rank`。所有键名现在都取自 `llama-arch.cpp` 的 `"%s.<name>"` 表，一张表
+174 个键，全部列出来对着挑。
+
+#### 验证
+
+- 完整 CUDA 构建 56/56，0 error；`strata-device --selftest` 通过
+- 6 个 CPU 测试全绿（新增 `geometry_reader_test`，写一个只有元数据的最小 GGUF 让 `read_geometry` 真跑）
+- **6 类变异全被抓住**（含上面两个 bug、前缀写死、门槛拒绝 qwen35moe、hc 不清零）
+
+写测试的 GGUF 写入器连错四次，每次报错都指向一个不同的真实约束，值得记下来：
+1. magic 必须是 `0x46554747`（"GGUF" 小端）
+2. 头是 **tensors count 在前、kv count 在后**（我一开始写反了）
+3. `MetaType::U32` 的 type id 是 **4**（enum 里 U8=0 I8 U16 I16 U32）。我一度"修正"成 6，那是 F32 ——
+   改错之后**所有键都读成 0**，看起来像逻辑 bug，其实是 type id 错位
+4. data_start 默认对齐是 **32**，不是 8
+
+**`Geometry` 里那 20 个字段一个都没参与本阶段测试** —— 它们全在 `dense_ffn`/`n_ff` 之外，
+真正的 MoE 数值路径（router top-8、专家 GEMV、combine）仍然只有 Flash-Next 的实现在跑。
+
+#### 阶段 3 剩下的真活
+
+1. **没有加载过任何 qwen35moe 权重**。这里锁的是元数据解析，不是数值。
+2. `mtp`（Qwen3.6-35B 带 `mtp.layers.0`，`linear_fc1`/`linear_fc2`）完全没碰。
+3. 阶段 5（GGUF 量化）之前拿不到真文件。
 
 ### 阶段 4：稠密 FFN（Qwen3.8-27B 专用）— **代码完成，未做真实权重推理**
 
