@@ -308,50 +308,53 @@ prompt 路径里是耦合的**，动 GR 要连带看 PLE。
 
 #### 阶段 3 剩下的真活（已实测，不是估计）
 
-**1. prompt 路径的 289 处编译期几何常量。** `src/prefill/prefill.cpp:90`:
+**真正的瓶颈不是那 289 处，而是专家 blob 的字节布局本身。**
+
+我先数了 prompt 路径的编译期常量（`prefill.cpp:90`，`N/K/D/ZV/LR/HC/HV/C/NE`，共 **289 处**），
+正准备动手。但往下查了一层，发现这些常量本身不是终点：
 
 ```cpp
-constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
-constexpr int64_t C = 10240, ZV = 6144, HV = 48;
+// include/strata/kernels/cpu/expert.hpp:33
+// ---- geometry, all of it fixed by the artifact (tools/verify_q2_0_geometry.py: 202/202 tensors at QK=64) ----
+inline constexpr int H = 2560;      // n_embd
+inline constexpr int FF = 640;      // expert intermediate width
+inline constexpr int NE = 512;      // routed experts per layer
+inline constexpr size_t BLOB = 3ull * (H * FF * BB / QK);   // 1,382,400
 ```
 
-逐一数过，共 **289 处**引用，其中 9 个常量全是模型几何：
-
-| 常量 | 是什么 | 引用数 |
-|---|---|---|
-| N | n_embd | 113 |
-| K | top-k | 76 |
-| D | n_embd × hc | 32 |
-| ZV | ssm_value_dim | 15 |
-| LR | hc_lr | 15 |
-| HC | hc | 12 |
-| HV | ssm_v_heads | 10 |
-| C | ssm_conv_channels | 9 |
-| NE | n_expert | 7 |
-
-**好消息**：它不是静默出错。L737 有一道门：
+**`H / FF / NE / BLOB` 是产物格式的常量，不是 prompt 路径的局部常量。** 三个 prefill kernel 把 blob 的
+字节偏移写死在编译期：
 
 ```cpp
-if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
-    err = "prefill: geometry differs from the artifact's"; return false;
-}
+// src/prefill/moe_mmq.cu:60, kernels.cu:660, moe_fused.cu:46 —— 同一个式子抄了三遍
+constexpr size_t O_D_CODES = (size_t) 1280 * 640, O_GU_SC = O_D_CODES + (size_t) 2560 * 160,
+               O_D_SC = O_GU_SC + (size_t) 1280 * 40 * 2;
 ```
 
-所以给一个 qwen35moe 文件跑 prefill 会**明确报错**，而不是算出垃圾。这一点和阶段 4 那个 27 倍
-静默越界不一样 —— 这里的作者留了门。
+`1280 = 2 × FF`（gate/up 各一行）、`2560 = H`、`40 = H/QK`。而 `O_D_CODES = 1280 × 640` 就是
+`BLOB` 的主要成分。
 
-**坏消息**：门后面 289 处要改，其中两处卡在编译期：
+#### 所以真正的顺序是
 
-```cpp
-static constexpr int kGrpEv = NE / 16 + 2;      // L397
-static constexpr size_t kHostBounds = 2 * (NE + NE / 16 + 2) + 64;   // L446
-```
+要让 Qwen3.6-35B 跑起来，改的顺序**不能反**：
 
-这两处是 `static constexpr`，要变成运行时成员才能跟着 `n_expert` 变。
+1. **先有产物。** blob 的布局（哪些行、什么量化、多宽）由打包器
+   `tools/verify_q2_0_geometry.py` 定的，而这个打包器是**为 Flash-Next 的 512×640×2560 写的**。
+   Qwen3.6-35B 是 256 专家 × 64 宽 × 2048。**产物里目前没有这种形状** —— 这是阶段 5。
+2. **产物有了，`H/FF/NE/BLOB` 才能按产物填。** `ExpertLayout` 已经有 `bytes[]`（每层 blob 大小）
+   和 `native` 分支，但 Q2_0 那条非 native 分支直接返回编译期的 `BLOB`。
+3. **然后才是那 289 处。** `N → m.g->n_embd`、`K → m.ss->k`、`NE → m.g->n_expert`，机械替换。
 
-注意 `NE / 16` 这个 16 是 `MMQ_GROUP`（分组宽度），**Qwen3.6-35B 的 256 个专家要 16 个组**，
-而 Flash-Next 的 512 也是 16 组 —— 巧合相等，但不是因为设计如此。改的时候要确认 `MMQ_GROUP`
-本身是不是也该参数化（它现在 42 处引用，是个调优旋钮，未必是几何）。
+反过来做（先改 289 处、再想办法对上产物）会得到一个**编译通过、数值错误**的版本：kernel 按 2048 读
+一个按 2560 排布的 blob，读到的是有限的、看起来合理的错数字 —— 和阶段 4 那个 27 倍越界同一类，
+但这次连 L737 那道门都拦不住（因为几何本身是对的，只是 blob 布局不对）。
+
+#### 那道门拦得住什么、拦不住什么
+
+L737 检查 `g.n_embd != N || g.hc != HC || ...`：几何不一致 → 明确报错。这挡得住"拿 qwen35moe 的
+几何配 Flash-Next 的常量"。但一旦 blob 布局那层没跟上，几何全对而字节偏移错，门是绿的。
+
+**所以阶段 3 的正确前置是阶段 5（GGUF 打包），不是那 289 处。**
 
 **2. decode 路径已有守卫但也有硬编码**（`src/core/layer.cpp` / `verify.cpp`）：
 
