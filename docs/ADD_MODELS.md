@@ -427,8 +427,39 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
 canonical Q2_0 路径的 826 处是"让 canonical 也支持别的形状"的工作，不在阶段 3 的目标里
 （而且 canonical 连模型 GGUF 参数都没有，见上面）。
 
-`tools/iq_pack.py` 也已经参数化（`n_expert` 从 router 张量读、`blob` 从张量字节算、注释明写
-支持 pruned 模型），所以**产物侧不需要写代码**。
+#### 但上面那句"产物侧不需要写代码"当时是错的 —— 两处都要改，都已改完
+
+拿合成 qwen35moe GGUF 真跑一遍 `iq_pack.py`，两处立刻露出来（提交 `7b498e7`、`33c17f8`）：
+
+1. **`iq_pack.py` 不认融合张量。** `tools/iq_pack.py` 的 `ROLES = ("gate", "up", "down")`
+   只找分离的 `ffn_gate_exps`/`ffn_up_exps`，而 Qwen3.6 只有融合的 `ffn_gate_up_exps`
+   （llama.cpp `llama-model.cpp:3263`：`{n_embd, 2*n_ff, n_expert}`，分离分支只是 fallback）。
+   结果是直接 `missing blk.0.ffn_gate_exps.weight`。现在按**行**切：gate `[0, n_ff)`、up `[n_ff, 2*n_ff)`。
+   按字节对半在两半量化类型不同时会错，行切不会。
+
+2. **`expert_layout_load` 把编译期的 `H`/`FF` 传给 `native_fmt()`。** 这一处我一开始漏了，
+   因为上一节只查了 `iq_kernels.cu` 而没查 loader：`native_fmt()` 本身完全参数化，
+   但它的两个入参写死成 2560/640，于是 Qwen3.6 的包必然被拒：
+
+   ```
+   layer 0 blob is 245760 B but its formats make 3072000
+   ```
+
+   `native_experts.txt` **v5** 因此在头部带 `n_embd`/`n_ff`（packer 从 down 张量的
+   `[n_ff, n_embd, n_expert]` 读，不臆造），loader 有该键就用它、没有就沿用编译期几何
+   （v3/v4 老包不受影响）。`kExpertLayoutVersion` 提到 5，旧引擎会响亮拒绝而不是误读列。
+
+**结论不变但理由换了**：native 路线确实不需要碰那 826 处，但它需要打包器和 loader 各改一处，
+两处都小、都被测试钉住了。scratch 缓冲区（`kNativeActBytes=4096`/`kNativeHBytes=1024`）不用动
+—— Qwen3.6 的 2048/64 远在限内，而超限的路径 `native_expert.cpp:64` 本来就报错而不是溢出。
+
+### 测试现状（实测，不是估计）
+
+- CPU 手工回归 **7/7**，q35 metadata 变异 **7/7**，generate/native-head 变异 **13/13**
+- 完整 CTest **69/72 通过**。三个失败是 `ple_parity` / `expert_parity` / `pool_test`，
+  都因为要读 `pack/full/experts.bin` —— 而 `pack/` 在 `.gitignore` 第 13 行、仓库里不存在，
+  任何 clone 上这三个都是红的，与本次改动无关。
+- `native_expert_parity_*` 六组（含 `q5_1_min` 小 n_ff 路径）全过。
 
 #### 一个必须区分的坑：路由专家宽度有两条来源
 
