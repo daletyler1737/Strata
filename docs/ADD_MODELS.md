@@ -306,115 +306,65 @@ prompt 路径里是耦合的**，动 GR 要连带看 PLE。
 **`Geometry` 里那 20 个字段一个都没参与本阶段测试** —— 它们全在 `dense_ffn`/`n_ff` 之外，
 真正的 MoE 数值路径（router top-8、专家 GEMV、combine）仍然只有 Flash-Next 的实现在跑。
 
-#### 阶段 3 剩下的真活
+#### 阶段 3 剩下的真活（已实测，不是估计）
 
-1. **没有加载过任何 qwen35moe 权重**。这里锁的是元数据解析，不是数值。
-2. `mtp`（Qwen3.6-35B 带 `mtp.layers.0`，`linear_fc1`/`linear_fc2`）完全没碰。
-3. 阶段 5（GGUF 量化）之前拿不到真文件。
-
-### 阶段 4：稠密 FFN（Qwen3.8-27B 专用）— **代码完成，未做真实权重推理**
-
-先查了 `model.safetensors.index.json`（不是 config.json），第 0 层的 FFN 张量是：
-
-```
-mlp.gate_proj.weight / mlp.up_proj.weight / mlp.down_proj.weight
-```
-
-**64 层全是稠密 SwiGLU，没有 `first_k_dense_replace`，也没有 `mlp.gate.weight`（router）。**
-所以之前那个"intermediate_size 可能是 MoE 前缀"的担心不存在 —— 也不用等谁的答复。
-
-#### 结论：不需要新 GEMV kernel
-
-`shared_expert` 已经是**任意 (n_embd, n_ff) 的纯 SwiGLU**。原来的疑虑（"shape 是
-`[n_embd, n_ff] → [n_ff, n_embd]`"）是把 Flash-Next 的 640 套上去了；`tpr` 只是
-`s2_gemv_q8` 的 `threads_per_row` 性能旋钮，不是几何约束。真正挡路的只有两样：
-
-1. **张量名**：kernel 写死 `ffn_{gate,up,down}_shexp`，稠密层是 `mlp.{gate,up,down}_proj`。
-2. **每 token 的标量 gate**：`ffn_gate_inp_shexp` 是 Qwen4-Exp 的东西 —— 一个 `(n_embd,)` 向量
-   压成**一个** sigmoid 去缩放整个专家输出。稠密层没有这个张量。
-
-两样都不是新 kernel：`shared_expert()` 加一个 `gate_inp_bf16 == nullptr` 的早退（没有标量
-gate 就已经算完了），宿主侧新增 `ffn_dense()` 换张量名。
-
-#### 真正的坑：`n_ff` 不是稠密的 FFN 宽度
-
-MoE pack 的 `n_ff` 是**每个专家**的宽度（640）；稠密 pack 的 FFN 宽度是
-`intermediate_size`（**17408**，27 倍）。两者共用一个字段的后果不是报错，而是：
-
-- 投影宽度错 27 倍 —— gate GEMV 从 640 行的矩阵里读 17408 行，后面的行落在 arena 里
-  紧邻的下一个张量上。**一个有限的、看起来合理的、完全错误的结果。**
-- `shared_expert_scratch_bytes(g.n_ff)` 按 640 分配，稠密要 17408 → **静默越界写穿**
-  up/down 缓冲。没有边界检查，不崩，只是隔壁缓冲被搞坏。
-
-修法是给几何加 `dense_ffn`，并把宽度收敛成**一个**函数：
+**1. prompt 路径的 289 处编译期几何常量。** `src/prefill/prefill.cpp:90`:
 
 ```cpp
-int64_t ffn_width() const { return has_moe() ? n_ff : dense_ffn; }
+constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
+constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 ```
 
-在 `ModelGeometry` 里，不是 `layer.cpp` 里，也不是测试里 —— 阶段 0 的教训。第二份副本
-在测试里等于**什么都没锁**（我的第一版变异脚本就栽在这：改源文件而测试跑的是自己的副本，
-3 个变异里 1 个"存活"，其实是根本没测到）。
+逐一数过，共 **289 处**引用，其中 9 个常量全是模型几何：
 
-#### 已经验证的
-
-- 完整 CUDA 构建 0 error，`strata-device --selftest` 通过
-- 5 个 CPU 测试全绿（新增 `dense_ffn_test`）
-- 3 类变异全被抓住：
-  - `ffn_width` 退回 `n_ff` → CAUGHT
-  - `ffn_width` 无条件用 `dense_ffn`（MoE pack 归零，FPE）→ CAUGHT
-  - `ffn_width` 无条件用 `n_ff != 0 ? ... ` → **第一次存活**，补了"稠密 pack 带着残留
-    `n_ff = 640`"的夹具才抓住。这个夹具是真的会发生的：`has_moe()` 看的是 `n_expert == 0`，
-    而 `n_ff` 是 metadata 里剩下的那个数。
-
-#### 还没验证的（阶段 4 的真正剩余工作）
-
-**没有任何真实 Qwen3.8-27B 权重被加载过。** 上面锁的是算术和分支，不是数值。稠密 FFN 的
-GEMV 在 17408 宽下的正确性、`expert_source` 的 mmap/CPU fallback 是否真的扛得住 178 MB/层，
-都要等阶段 5（GGUF 量化）之后才能实测。
-
-### 阶段 5：量化格式（未评估，可能最大）
-
-Strata 走 **GGUF i-quant**（从 llama.cpp 抄的 dequant），量化产物是
-`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` 家的 GSQ-RCO。
-
-而 `Qwen3.6-35B-A3B-NVFP4` 你手上那个是 **NVFP4 / MXFP4**（Blackwell tensor-core 原生格式）。
-这两套**没有转换路径**，需要：
-- 要么用 `unsloth` 的 GGUF 重新量化目标模型（多一步，但复用 Strata 现有 dequant）
-- 要么给 Strata 加 NVFP4 dequant（`src/artifact/dequant.cpp` 重写，且 `nvfp4` 需要 sm_100+，
-  你的 RTX 3060 是 sm_86，**硬件就不支持**）
-
-**建议**：一律走 GGUF 路线，别碰 NVFP4。
-
-### 阶段 6：多模态（可选）
-
-三个模型都有 `vision_config`。Strata 用 llama.cpp 的 `mtmd`（`tools/vision/strata_vision.cpp`）。
-`out_hidden_size` 变了（5120 / 2048），`tools/embd_bf16_pack.py` 和
-`src/core/native_head.cpp` 的投影维度要跟着改。
-
----
-
-## 4. 硬件现实
-
-| | 需要 | 你有（实测 nvidia-smi） |
+| 常量 | 是什么 | 引用数 |
 |---|---|---|
-| 显存 | ≥ 12 GB（官方最低档） | **6 GB**（RTX 3060 Laptop, 6144 MiB） |
-| 内存 | ≥ 32 GB | 39.8 GB ✓ |
-| 磁盘 | 66–76 GB 下载 | E 盘 389 GB ✓ |
+| N | n_embd | 113 |
+| K | top-k | 76 |
+| D | n_embd × hc | 32 |
+| ZV | ssm_value_dim | 15 |
+| LR | hc_lr | 15 |
+| HC | hc | 12 |
+| HV | ssm_v_heads | 10 |
+| C | ssm_conv_channels | 9 |
+| NE | n_expert | 7 |
 
-**改造完你也跑不起来原版 Flash-Next。** 但改造完的 Qwen3.6-35B-A3B（A3B = 每 token 只激活 3B）
-在 6 GB 显存 + GGUF Q4 下理论可跑 —— 前提是阶段 1–3 全做完。这才是「值得改造」的那一个。
-Qwen3.8-27B 是稠密 27B，6 GB 显存跑不动，改造它主要是为了架构验证（不需要 GPU 正确性，
-可以用 CPU parity 测试）。
+**好消息**：它不是静默出错。L737 有一道门：
 
----
+```cpp
+if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
+    err = "prefill: geometry differs from the artifact's"; return false;
+}
+```
 
-## 5. 建议路线
+所以给一个 qwen35moe 文件跑 prefill 会**明确报错**，而不是算出垃圾。这一点和阶段 4 那个 27 倍
+静默越界不一样 —— 这里的作者留了门。
 
-1. **先做 Qwen3.6-35B-A3B**（MoE 同族，改动最集中，且 6 GB 显存可能真跑得动）
-2. 阶段 0 + 1 + 2 + 3 全部完成后，用 `python tools/geometry_from_config.py` 的 `--check` 输出当验收清单
-3. Qwen3.8-27B（稠密）等 MoE 那套稳了再上，它主要验证「没有 MoE 时 Strata 的代码路径能不能退化成稠密」
-4. **跳过 NVFP4**，走 GGUF
+**坏消息**：门后面 289 处要改，其中两处卡在编译期：
 
-> ponytail: 没写 `docs/` 以外的任何东西，因为现在写 C++ 就是写一堆跑不起来的 kernel。
-> 先把「哪些文件要动、动的顺序、验收信号」钉死，比提前写 3000 行编译不过的 CUDA 值钱。
+```cpp
+static constexpr int kGrpEv = NE / 16 + 2;      // L397
+static constexpr size_t kHostBounds = 2 * (NE + NE / 16 + 2) + 64;   // L446
+```
+
+这两处是 `static constexpr`，要变成运行时成员才能跟着 `n_expert` 变。
+
+注意 `NE / 16` 这个 16 是 `MMQ_GROUP`（分组宽度），**Qwen3.6-35B 的 256 个专家要 16 个组**，
+而 Flash-Next 的 512 也是 16 组 —— 巧合相等，但不是因为设计如此。改的时候要确认 `MMQ_GROUP`
+本身是不是也该参数化（它现在 42 处引用，是个调优旋钮，未必是几何）。
+
+**2. decode 路径已有守卫但也有硬编码**（`src/core/layer.cpp` / `verify.cpp`）：
+
+```cpp
+native_router_enabled() && g.n_expert == 512 && k == 10      // layer.cpp:370
+native_router_enabled() && NE == 512 && K == 10              // verify.cpp:909
+```
+
+这两处是 **guarded fast path**：不匹配就走通用路径，所以是安全的（不匹配 = 慢，不是错）。
+但要确认 256 专家 / top-8 在通用路径上真的能跑，而不是只在这些 fast path 里被测过。
+
+**3. `mtp`（Qwen3.6-35B 带 `mtp.layers.0`，`linear_fc1`/`linear_fc2`）完全没碰。**
+
+**4. 没有加载过任何 qwen35moe 权重。** 阶段 5（GGUF 量化）之前拿不到真文件。
+
+。
