@@ -490,7 +490,11 @@ def expert_layout(model: Model, src: pathlib.Path):
     # H/FF, which only ever described Flash-Next: a pack of another model (qwen35moe: n_embd 2048, n_ff 64) produced
     # a blob the sizes disagreed with, so it was refused.  native_fmt() itself is fully parameterized; only the two
     # arguments were hardcoded.  Reading them from the pack makes the layout file describe the model it is for.
-    geom = "n_embd %d n_ff %d " % (n_embd_geom, n_ff_geom)
+    # n_layers is here for the same reason: generate.cpp passes read_geometry's n_layers, and that is not always
+    # what this table has.  A Qwen3.6 file's block_count counts the MTP block, and any future geometry read that
+    # lands one ahead of the packer turns the tail of the layout into default-constructed entries that
+    # native_expert_supported then reads as "layer 41's experts are ?/?" - a layer this file never had.
+    geom = "n_layers %d n_embd %d n_ff %d " % (len(layout), n_embd_geom, n_ff_geom)
     if n_split:
         head = ("# strata native experts v5: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
                 "[shard | gate,up,down] (n_expert %d, %stotal %d; absolute offsets in %s, or in the named shard "

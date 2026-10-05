@@ -56,6 +56,17 @@ int main(int argc, char** argv) {
     check(f.up_off > 0 && f.down_off > f.up_off && f.down_off < f.bytes,
           "up_off and down_off sit inside the blob, ordered after each other");
 
+    // generate.cpp walks `for (l = 0; l < lay.fmt.size(); ++l)` and refuses on gu_type < 0, so the loader must
+    // size fmt() to what the table actually holds.  Qwen3.6 has 41 blocks and 41 rows, and the gate once saw a
+    // "layer 41" - i.e. fmt was one longer than the table and the entry past the end was default-constructed.
+    const auto& L = strata::kernels::cpu::expert_layout();
+    check(L.fmt.size() == 41, "fmt() has exactly the table's 41 entries, no default-constructed 42nd");
+    check(L.offset.size() == 41 && L.bytes.size() == 41, "offset()/bytes() are 41 long too");
+    int unset = 0;
+    for (size_t i = 0; i < L.fmt.size(); ++i)
+        if (L.fmt[i].gu_type < 0 || L.fmt[i].d_type < 0) ++unset;
+    check(unset == 0, "no entry is left unset by the table");
+
     std::printf("real Qwen3.6 pack: %s\n", fails ? "FAILED" : "all cases pass");
     return fails ? 1 : 0;
 }

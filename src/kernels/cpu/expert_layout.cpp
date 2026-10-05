@@ -246,12 +246,11 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     return false;
 #else
     L.native = true;
-    L.fmt.resize((size_t) n_layers);
-    L.offset.assign((size_t) n_layers, ~0ull);
-    L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
     int64_t geom_embd = H, geom_ff = FF;      // the pack's geometry, or the compiled-in one for a v3/v4 pack
+    int64_t geom_layers = n_layers;          // a v5 header may declare its own count; see below
     std::string line;
+    bool sized = false;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
             if (!line.empty() && line[0] == '#') {
@@ -282,8 +281,23 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                     const size_t gf = line.find("n_ff ", ge);
                     if (gf != std::string::npos) geom_ff = std::atoll(line.c_str() + gf + 5);
                 }
+                // And its layer count, for the same reason in the other direction: the caller passes
+                // read_geometry's n_layers, which counts the MTP block and can land one ahead of what the packer
+                // wrote.  The tail of an over-sized layout is default-constructed, and generate.cpp's pre-flight
+                // loop then stops at "layer 41's experts are ?/?" naming a layer this file never had.
+                const size_t gl = line.find("n_layers ");
+                if (gl != std::string::npos) geom_layers = std::atoll(line.c_str() + gl + 9);
             }
             continue;
+        }
+        if (!sized) {
+            // The header is always the first line, so by the time a data row arrives the declared geometry is
+            // final and the three vectors can be sized to the table rather than to the caller's guess.
+            n_layers = geom_layers;
+            L.fmt.resize((size_t) n_layers);
+            L.offset.assign((size_t) n_layers, ~0ull);
+            L.bytes.assign((size_t) n_layers, 0);
+            sized = true;
         }
         std::istringstream ss(line);
         long long l = -1, gt = -1, dt = -1;
@@ -336,6 +350,12 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         L.bytes[(size_t) l] = blob;
         if (blob > L.max_blob) L.max_blob = blob;
     }
+    if (!sized) {                       // a header-only file: nothing will size the vectors, and the loop below reads them
+        n_layers = geom_layers;
+        L.fmt.resize((size_t) n_layers);
+        L.offset.assign((size_t) n_layers, ~0ull);
+        L.bytes.assign((size_t) n_layers, 0);
+    }
     // **A PACK'S OFFSET COLUMN MEANS DIFFERENT THINGS BY VERSION, AND THE LOOP MUST NOT ASSUME ONE.**
     //
     // Up to v4 the offset column was an index into the pack's OWN compact arena: layer l sits at
@@ -351,6 +371,13 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     //
     // So: keep the compact check for the versions that mean it, and for v5 check what its column actually
     // promises - every layer present, no two layers overlapping, and the span inside the arena's file.
+    //
+    // **THE CALLER'S n_layers IS NOT THE TABLE'S LAYER COUNT.**  generate.cpp passes read_geometry's n_layers,
+    // and a Qwen3.6 file reports 41 blocks of which the last is the MTP block - but the geometry read can be one
+    // ahead of what the packer wrote, and the two are not derived from each other.  A table shorter than n_layers
+    // leaves the tail default-constructed (gu_type -1) and generate.cpp then stops at "layer 41's experts are
+    // ?/?", naming a layer the table never had.  So a v5 header that declares its own count wins, the same way
+    // v3's declared n_expert does.
     uint64_t at = 0;
     if (L.version < 5) {
         for (int64_t l = 0; l < n_layers; ++l) {
@@ -366,7 +393,8 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         spans.reserve((size_t) n_layers);
         for (int64_t l = 0; l < n_layers; ++l) {
             const uint64_t o = L.offset[(size_t) l], span = L.bytes[(size_t) l] * (uint64_t) L.n_expert;
-            if (o == 0 && l > 0 && span == 0) {          // a layer with neither offset nor bytes was never written
+            // ~0ull is the "no row was written for this layer" sentinel, not 0 - layer 0 legitimately sits at 0.
+            if (o == ~0ull) {
                 err = "native_experts.txt: layer " + std::to_string(l) + " is missing";
                 return false;
             }
