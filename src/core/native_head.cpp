@@ -18,8 +18,11 @@ NativeHead::~NativeHead() {
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
     if (loaded()) { err = "native head is already loaded"; return false; }
-    if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
-        err = "native head requires positive int32 dimensions and whole 256-value rows";
+    // n_out <= 0 means "take the vocabulary width from output.weight's own shape": the caller often cannot know
+    // it (it is not a geometry field), and the tensor is read here anyway.  A positive n_out is still checked
+    // against that shape, so a caller that DOES know it keeps the cross-check.
+    if (n_in <= 0 || n_out > INT_MAX || n_in > INT_MAX || n_in % 256) {
+        err = "native head requires a positive int32 n_in on whole 256-value rows";
         return false;
     }
     try {
@@ -32,8 +35,14 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         const strata::TensorInfo* tensor = model.find("output.weight", &at);
         const strata::GgufFile& gguf = model.shard(at);
         if (!tensor || !strata::kernels::native_mmvq_supported((int) tensor->type) || tensor->shape.size() != 2 ||
-            tensor->shape[0] != (uint64_t) n_in || tensor->shape[1] != (uint64_t) n_out) {
+            tensor->shape[0] != (uint64_t) n_in ||
+            (n_out > 0 && tensor->shape[1] != (uint64_t) n_out)) {
             err = "native head: expected a natively supported output.weight with the canonical head dimensions";
+            return false;
+        }
+        if (n_out <= 0) n_out = (int64_t) tensor->shape[1];
+        if (n_out <= 0 || n_out > INT_MAX) {
+            err = "native head: output.weight has no vocabulary dimension";
             return false;
         }
         const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);

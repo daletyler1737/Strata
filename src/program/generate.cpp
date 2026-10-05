@@ -1992,28 +1992,19 @@ int main(int argc, char** argv) {
     // Plan v0.3 P6: where the experts live.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
-    {
-        const strata::core::ModelGeometry g0;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
-        }
-        // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
-        // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
-        // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
-            const auto& f = lay.fmt[(size_t) l];
-            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
-                std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
-                                     "engine has no GPU kernels for\n", (long long) l,
-                             strata::ggml_type_name((uint32_t) f.gu_type), strata::ggml_type_name((uint32_t) f.d_type),
-                             f.gu_type, f.d_type);
-                return 1;
-            }
-        }
-    }
-    const bool native_pack = strata::kernels::cpu::expert_layout().native;
+    // Plan v0.3 P6: WHERE THE EXPERTS LIVE.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps
+    // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
+    // come from the model file) and runs its experts in verify windows only (--spec).
+    //
+    // The LAYOUT is not loaded here: `native_pack` is only read further down, and `expert_layout_load`'s
+    // canonical Q2_0 branch has no metadata to fall back on - it takes the caller's n_layers / n_expert and
+    // compiles them into `blob_bytes()`.  Those were a default-constructed ModelGeometry (Flash-Next: 48 layers,
+    // 512 experts, n_ff 640) read ~80 lines BEFORE `read_geometry` below, so a qwen35moe pack was sized from
+    // Flash-Next's shape: an arena 25% too big, which is still an arena, so the first symptom was a plausible
+    // wrong number rather than a refusal.  It is loaded after the geometry is known instead.  The native pack was
+    // never wrong here - it reads n_expert from native_experts.txt's header and the header wins over the caller -
+    // but both paths now take the file's own numbers.
+    bool native_pack = false;   // set once the layout is loaded, past read_geometry
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
@@ -2034,29 +2025,8 @@ int main(int argc, char** argv) {
     // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
     // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
-    // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
-    if (o.pcie_frac < 0.0) {
-        const double base = native_pack ? 0.55 : 0.2;
-        std::string bursts;
-        const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
-        if (!native_pack) {
-            o.pcie_frac = base;
-        } else if (bw > 0.0) {
-            o.pcie_frac = pcie_frac_for_gbps(bw, base);
-            std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
-                                 "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
-        } else {
-            o.pcie_frac = base;
-            std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
-        }
-    }
-    // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
-    if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
-    else if (!strata::kernels::cpu::cpu_avx512_ok())
-        std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
-                             "(multi-token for the i-quant gate/up rows)\n",
-                     !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2: the older-CPU build)"
-                     : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+    // the PCIe share and the AVX-512 check both branch on `native_pack`, so they run with the layout load, past
+    // read_geometry.
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
@@ -2185,6 +2155,56 @@ int main(int argc, char** argv) {
                              rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
+    // The expert layout is loaded HERE, after read_geometry, so the canonical Q2_0 branch gets the model's own
+    // n_layers / n_expert instead of a default-constructed Flash-Next geometry.
+    if (!strata::kernels::cpu::expert_layout_load(o.pack, g.n_layers, g.n_expert, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
+    // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
+    // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
+    // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
+    native_pack = strata::kernels::cpu::expert_layout().native;
+    {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
+            const auto& f = lay.fmt[(size_t) l];
+            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
+                std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
+                                     "engine has no GPU kernels for\n", (long long) l,
+                             strata::ggml_type_name((uint32_t) f.gu_type), strata::ggml_type_name((uint32_t) f.d_type),
+                             f.gu_type, f.d_type);
+                return 1;
+            }
+        }
+    }
+    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
+    // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
+    // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
+    // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
+    // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
+    if (o.pcie_frac < 0.0) {
+        const double base = native_pack ? 0.55 : 0.2;
+        std::string bursts;
+        const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
+        if (!native_pack) {
+            o.pcie_frac = base;
+        } else if (bw > 0.0) {
+            o.pcie_frac = pcie_frac_for_gbps(bw, base);
+            std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
+                                 "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
+        } else {
+            o.pcie_frac = base;
+            std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
+        }
+    }
+    // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
+    if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
+    else if (!strata::kernels::cpu::cpu_avx512_ok())
+        std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
+                             "(multi-token for the i-quant gate/up rows)\n",
+                     !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2: the older-CPU build)"
+                     : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
@@ -2193,9 +2213,12 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
-        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g0.n_embd,
-                               248320, err)) {
+        // The embedding's input width comes from the file; its output width (the vocabulary) is not a geometry
+        // field, so it is left to NativeHead::load to read from output.weight's own shape.  This was a
+        // default-constructed ModelGeometry's n_embd (2560) and a literal 248320 - Flash-Next's row width and
+        // vocabulary - so a qwen35moe pack loaded its embedding with the wrong shape.
+        if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf},
+                               g.n_embd, /*n_out=*/0, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
