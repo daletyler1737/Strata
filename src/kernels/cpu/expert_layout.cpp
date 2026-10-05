@@ -249,6 +249,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
+    int64_t geom_embd = H, geom_ff = FF;      // the pack's geometry, or the compiled-in one for a v3/v4 pack
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
@@ -270,6 +271,16 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // default, so the header wins.
                 const size_t at = line.find("(n_expert ");
                 if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                // v5 packs also carry the expert geometry.  Up to v4 it came from this file's compiled-in H/FF,
+                // which only ever described Flash-Next, so a pack of another model produced a NativeFmt whose
+                // sizes disagreed with the blob column and was refused.  A v3/v4 pack has no such key and keeps
+                // the compiled-in geometry.
+                const size_t ge = line.find("n_embd ");
+                if (ge != std::string::npos) {
+                    geom_embd = std::atoll(line.c_str() + ge + 7);
+                    const size_t gf = line.find("n_ff ", ge);
+                    if (gf != std::string::npos) geom_ff = std::atoll(line.c_str() + gf + 5);
+                }
             }
             continue;
         }
@@ -281,7 +292,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, geom_embd, geom_ff, f, err)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);

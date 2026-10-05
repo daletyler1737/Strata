@@ -77,6 +77,8 @@ const ExpertLayout& expert_layout();
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
-inline constexpr int kExpertLayoutVersion = 4;
+/// v5 = v4 plus `n_embd` / `n_ff` in the header, so the expert geometry comes from the pack instead of this
+/// binary's compiled-in Flash-Next geometry (a qwen35moe pack: n_embd 2048, n_ff 64).
+inline constexpr int kExpertLayoutVersion = 5;
 
 }  // namespace strata::kernels::cpu

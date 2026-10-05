@@ -106,10 +106,16 @@ void real_packs(const fs::path& data) {
 }
 
 // ---- 2. the v4 column and the refusals
-std::string manifest(int version, const std::string& col1, int64_t blob, int n_expert = 2) {
+// geom: 0 = no geometry in the header (v3/v4, the engine uses its compiled-in Flash-Next 2560/640);
+//       otherwise "n_embd <e> n_ff <f> " is written into the header (v5), and blob must be native_fmt()'s size at
+//       that geometry - a pack of another model cannot have the compiled-in one.
+std::string manifest(int version, const std::string& col1, int64_t blob, int n_expert = 2, int64_t n_embd = 0,
+                     int64_t n_ff = 0) {
     std::string s = "# strata native experts v" + std::to_string(version) +
                     ": layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard | gate,up,down] "
-                    "(n_expert " + std::to_string(n_expert) + ", total " + std::to_string(2 * blob * n_expert) + ")\n";
+                    "(n_expert " + std::to_string(n_expert) + ", ";
+    if (n_embd) s += "n_embd " + std::to_string(n_embd) + " n_ff " + std::to_string(n_ff) + " ";
+    s += "total " + std::to_string(2 * blob * n_expert) + ")\n";
     s += "0 12 7 0 " + std::to_string(blob) + " 100 200 300\n";
     s += "1 12 7 " + std::to_string(blob * n_expert) + " " + std::to_string(blob) + " 400 500 600" +
          (col1.empty() ? "" : " " + col1) + "\n";
@@ -136,9 +142,37 @@ void columns() {
     ok = load(d.path, 2, 512, err);
     check(ok && L.gguf_file[3] == "A.gguf" && L.gguf_file[4] == "A.gguf" && L.gguf_file[5] == "A.gguf",
           "v3: one name covers the three roles");
-    write_text(d.path / "native_experts.txt", manifest(5, "", blob));
+    write_text(d.path / "native_experts.txt", manifest(6, "", blob));
     ok = load(d.path, 2, 512, err);
-    check(!ok && err.find("v5") != std::string::npos, "v5 is refused (\"" + err.substr(0, 40) + "...\")");
+    check(!ok && err.find("v6") != std::string::npos, "v6 is refused (\"" + err.substr(0, 40) + "...\")");
+
+    // ---- v5: the geometry comes from the pack, not from this binary's compiled-in Flash-Next 2560/640
+    {
+        strata::kernels::cpu::NativeFmt g64;
+        std::string e2;
+        if (!strata::kernels::cpu::native_fmt(12, 7, 2048, 64, g64, e2)) {
+            check(false, "qwen35moe geometry (2048/64) is not a native format: " + e2);
+            return;
+        }
+        const int64_t blob64 = (int64_t) g64.bytes;
+        write_text(d.path / "native_experts.txt", manifest(5, "", blob64, 2, 2048, 64));
+        ok = load(d.path, 2, 512, err);
+        const ExpertLayout& L5 = strata::kernels::cpu::expert_layout();
+        check(ok && L5.version == 5 && L5.fmt[0].n_embd == 2048 && L5.fmt[0].n_ff == 64 &&
+                  L5.fmt[0].bytes == g64.bytes && L5.bytes[0] == (size_t) blob64,
+              "v5: the pack's n_embd 2048 / n_ff 64 reach native_fmt, so its blob column agrees ("
+                  + std::to_string(L5.fmt[0].n_embd) + "/" + std::to_string(L5.fmt[0].n_ff) + ")"
+                  + (ok ? "" : ": " + err));
+        // and the same blob under the COMPILED-IN geometry must be refused, or the header was not read at all
+        write_text(d.path / "native_experts.txt", manifest(5, "", (int64_t) f.bytes, 2, 2048, 64));
+        ok = load(d.path, 2, 512, err);
+        check(!ok && err.find("blob is") != std::string::npos,
+              "v5: a Flash-Next-sized blob under a 2048/64 header is refused (the geometry was really read)");
+        // a v3 pack of the same model keeps the compiled-in geometry and is refused the same way
+        write_text(d.path / "native_experts.txt", manifest(3, "", blob64));
+        check(!load(d.path, 2, 512, err),
+              "v3 has no geometry column, so a 2048/64 blob does not fit this binary's 2560/640");
+    }
     write_text(d.path / "native_experts.txt", manifest(4, "a,b,c,d", blob));
     check(!load(d.path, 2, 512, err) && err.find("gate,up,down") != std::string::npos, "four names are refused");
     write_text(d.path / "native_experts.txt", manifest(4, "a,b", blob));

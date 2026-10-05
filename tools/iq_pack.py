@@ -440,6 +440,10 @@ def expert_layout(model: Model, src: pathlib.Path):
     if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
     layout, lines, offset, n_split = [], [], 0, 0
+    # the geometry the engine's native_fmt() needs, read off the first layer's own shapes:
+    # the down tensor is [n_ff, n_embd, n_expert], so its shape gives both (llama.cpp's ffn_down_exps).
+    n_ff_geom = int(T["blk.0.ffn_down_exps.weight"].shape[0])
+    n_embd_geom = int(T["blk.0.ffn_down_exps.weight"].shape[1])
     for l in range(n_layers):
         # qwen35moe (Qwen3.6) ships ONE fused gate_up tensor per layer, where Flash-Next ships separate
         # ffn_gate_exps / ffn_up_exps (llama.cpp's qwen35moe.cpp has both branches).  The blob layout is
@@ -454,6 +458,9 @@ def expert_layout(model: Model, src: pathlib.Path):
         ts = [T[n] for n in dict.fromkeys(names)]      # a fused tensor is one source, listed twice
         if any(t.expected_bytes() is None or len(t.shape) != 3 or int(t.shape[2]) != n_expert for t in ts):
             return "layer %d: an expert tensor is not [*, *, %d] of whole blocks" % (l, n_expert)
+        if int(ts[-1].shape[0]) != n_ff_geom or int(ts[-1].shape[1]) != n_embd_geom:
+            return "layer %d: the down tensor is [*, %d, %d], not [n_ff=%d, n_embd=%d, *]" % (
+                l, ts[-1].shape[0], ts[-1].shape[1], n_ff_geom, n_embd_geom)
         if fused in T and names[0] == names[1]:
             # a fused gate_up is [n_embd, 2*n_ff, n_expert]: gate is rows [0, n_ff), up is [n_ff, 2*n_ff).
             # Split by ROWS, not bytes: the quantized rows of the two halves are the same width, so half the
@@ -479,16 +486,21 @@ def expert_layout(model: Model, src: pathlib.Path):
         line = "%d %d %d %d %d %d %d %d" % (l, ts[0].type_id, ts[-1].type_id, offset, blob, *offs)
         lines.append(line + ("" if not column else " " + column))
         offset += blob * n_expert
+    # v5 adds the expert geometry to the header.  Up to v4 the engine derived NativeFmt from its own compiled-in
+    # H/FF, which only ever described Flash-Next: a pack of another model (qwen35moe: n_embd 2048, n_ff 64) produced
+    # a blob the sizes disagreed with, so it was refused.  native_fmt() itself is fully parameterized; only the two
+    # arguments were hardcoded.  Reading them from the pack makes the layout file describe the model it is for.
+    geom = "n_embd %d n_ff %d " % (n_embd_geom, n_ff_geom)
     if n_split:
-        head = ("# strata native experts v4: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
-                "[shard | gate,up,down] (n_expert %d, total %d; absolute offsets in %s, or in the named shard "
-                "beside it - per role where the column is gate,up,down)\n" % (n_expert, offset, src.name))
-        print("%d layer(s) have their gate/up/down in different shards: native_experts.txt v4, per-role shard "
+        head = ("# strata native experts v5: layer gu_type d_type offset blob_bytes gate_off up_off down_off "
+                "[shard | gate,up,down] (n_expert %d, %stotal %d; absolute offsets in %s, or in the named shard "
+                "beside it - per role where the column is gate,up,down)\n" % (n_expert, geom, offset, src.name))
+        print("%d layer(s) have their gate/up/down in different shards: native_experts.txt v5, per-role shard "
               "column for %s" % (n_split, ", ".join(str(l) for l, *_ in layout if "," in lines[l])))
     else:
-        head = ("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
-                "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
-                % (n_expert, offset, src.name))
+        head = ("# strata native experts v5: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
+                "(n_expert %d, %stotal %d; absolute offsets in %s, or in the named shard beside it)\n"
+                % (n_expert, geom, offset, src.name))
     return layout, head + "".join(line + "\n" for line in lines), n_expert, offset
 
 
