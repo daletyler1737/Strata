@@ -2075,13 +2075,38 @@ int main(int argc, char** argv) {
             // is the authority on its own MoE shape - everything else in the geometry is unchanged
             try {
                 strata::GgufFile model_gguf(o.native_shards.front());   // the metadata shard
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base = v->num();
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.type")) gguf_rope_type = v->s;
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.factor")) gguf_rope_factor = v->num();
-                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.rope.scaling.original_context_length"))
+                // **THE WHOLE GEOMETRY COMES FROM THE FILE, UNDER THE FILE'S OWN ARCH PREFIX.**  This used to
+                // read only expert_count / expert_used_count and leave n_embd = 2560, n_layers = 48,
+                // n_head = 24 as compile-time defaults, so a qwen35moe file was sized from Flash-Next's shape
+                // — an arena 25% too big, which is still an arena, so the first symptom is a plausible wrong
+                // number rather than a refusal.  `read_geometry` reads every field and reports a missing
+                // REQUIRED key instead of defaulting it; only head_dim is optional (derived n_embd/n_head).
+                std::string geo_err;
+                if (!strata::read_geometry(model_gguf, g, geo_err)) {
+                    std::fprintf(stderr, "strata generate: reading the model's geometry from %s: %s\n",
+                                 o.native_shards.front().c_str(), geo_err.c_str());
+                    return 1;
+                }
+                // The arch prefix follows general.architecture; hardcoding qwen4exp. meant a qwen35moe file
+                // silently answered "no rope keys, no expert shape" and ran with the defaults.
+                const strata::MetaValue* arch = model_gguf.get("general.architecture");
+                const std::string rp = arch ? std::string(arch->s) + "." : std::string("qwen4exp.");
+                // top-k is not a geometry field: K is the router's selection width and the graph asks for it
+                // separately, so it is read here and only here.
+                if (const strata::MetaValue* v = model_gguf.get(rp + "expert_used_count")) K = (int64_t) v->u;
+                if (const strata::MetaValue* v = model_gguf.get(rp + "rope.freq_base")) gguf_rope_base = v->num();
+                if (const strata::MetaValue* v = model_gguf.get(rp + "rope.scaling.type")) gguf_rope_type = v->s;
+                if (const strata::MetaValue* v = model_gguf.get(rp + "rope.scaling.factor")) gguf_rope_factor = v->num();
+                if (const strata::MetaValue* v = model_gguf.get(rp + "rope.scaling.original_context_length"))
                     gguf_rope_orig_ctx = v->num();
+                // ponytail: no per-model branch anywhere.  Every difference between the two families is a
+                // number in the file, so adding a third is a GGUF converter's job, not this file's.
+                std::fprintf(stderr, "strata generate: %s geometry: %lld layers, n_embd %lld, %lld heads/%lld kv, "
+                                     "head_dim %lld, %lld experts top-%lld, ff width %lld, ssm %lld\n",
+                             arch ? arch->s : "?", (long long) g.n_layers, (long long) g.n_embd,
+                             (long long) g.n_head, (long long) g.n_head_kv, (long long) g.head_dim,
+                             (long long) g.n_expert, (long long) K, (long long) g.ffn_width(),
+                             (long long) g.ssm_state_size);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
                              o.native_preset.c_str(), e.what());
