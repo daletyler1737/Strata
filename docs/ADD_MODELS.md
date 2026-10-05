@@ -234,7 +234,7 @@ strata::kernels::add_inplace(bb.R, bb.block_out, g.n_embd, stream);    // 残差
 注意：`gr_*` 在 `prefill/kernels.cu` 里也占 10 处、`ple.cu` 占 45 处 —— 说明 **PLE 和 GR 在
 prompt 路径里是耦合的**，动 GR 要连带看 PLE。
 
-### 阶段 3：MoE 参数化（Qwen3.6-35B-A3B 专用，3–5 天）
+### 阶段 3：MoE 参数化（Qwen3.6-35B-A3B 专用，3–5 天）— 未开始
 
 Qwen3.6-35B-A3B 仍是 MoE（256 专家 / top-8 / n_ff=512），结构同族，改动相对小：
 
@@ -248,15 +248,66 @@ Qwen3.6-35B-A3B 仍是 MoE（256 专家 / top-8 / n_ff=512），结构同族，�
 
 Qwen3.8-27B **没有 MoE**，走阶段 4。
 
-### 阶段 4：稠密 FFN（Qwen3.8-27B 专用，2–3 天）
+### 阶段 4：稠密 FFN（Qwen3.8-27B 专用）— **代码完成，未做真实权重推理**
 
-27B 是**稠密模型**，`intermediate_size = 17408`（vs shared_expert 的 640）。
-Strata 里没有稠密 FFN 的 GEMV 路径 —— `shared_expert.cu` 是最近的那个，但它的 shape 是
-`[n_embd, n_ff] → [n_ff, n_embd]`，n_ff=17408 时：
-- 显存：17408×5120×2 bytes = 178 MB/层 × 64 层 = **11.4 GB 常驻**，放不进 6 GB 显存，
-  得走 `expert_source` 的 mmap + CPU fallback（和现在专家一个待遇）
-- `intermediate_size` 是 MoE 前缀的稠密 FFN，还是全层都有？**这个必须去 model.safetensors.index.json
-  里查真实的张量名**，config.json 没写 `first_k_dense_replace` / `moe_layer_freq`
+先查了 `model.safetensors.index.json`（不是 config.json），第 0 层的 FFN 张量是：
+
+```
+mlp.gate_proj.weight / mlp.up_proj.weight / mlp.down_proj.weight
+```
+
+**64 层全是稠密 SwiGLU，没有 `first_k_dense_replace`，也没有 `mlp.gate.weight`（router）。**
+所以之前那个"intermediate_size 可能是 MoE 前缀"的担心不存在 —— 也不用等谁的答复。
+
+#### 结论：不需要新 GEMV kernel
+
+`shared_expert` 已经是**任意 (n_embd, n_ff) 的纯 SwiGLU**。原来的疑虑（"shape 是
+`[n_embd, n_ff] → [n_ff, n_embd]`"）是把 Flash-Next 的 640 套上去了；`tpr` 只是
+`s2_gemv_q8` 的 `threads_per_row` 性能旋钮，不是几何约束。真正挡路的只有两样：
+
+1. **张量名**：kernel 写死 `ffn_{gate,up,down}_shexp`，稠密层是 `mlp.{gate,up,down}_proj`。
+2. **每 token 的标量 gate**：`ffn_gate_inp_shexp` 是 Qwen4-Exp 的东西 —— 一个 `(n_embd,)` 向量
+   压成**一个** sigmoid 去缩放整个专家输出。稠密层没有这个张量。
+
+两样都不是新 kernel：`shared_expert()` 加一个 `gate_inp_bf16 == nullptr` 的早退（没有标量
+gate 就已经算完了），宿主侧新增 `ffn_dense()` 换张量名。
+
+#### 真正的坑：`n_ff` 不是稠密的 FFN 宽度
+
+MoE pack 的 `n_ff` 是**每个专家**的宽度（640）；稠密 pack 的 FFN 宽度是
+`intermediate_size`（**17408**，27 倍）。两者共用一个字段的后果不是报错，而是：
+
+- 投影宽度错 27 倍 —— gate GEMV 从 640 行的矩阵里读 17408 行，后面的行落在 arena 里
+  紧邻的下一个张量上。**一个有限的、看起来合理的、完全错误的结果。**
+- `shared_expert_scratch_bytes(g.n_ff)` 按 640 分配，稠密要 17408 → **静默越界写穿**
+  up/down 缓冲。没有边界检查，不崩，只是隔壁缓冲被搞坏。
+
+修法是给几何加 `dense_ffn`，并把宽度收敛成**一个**函数：
+
+```cpp
+int64_t ffn_width() const { return has_moe() ? n_ff : dense_ffn; }
+```
+
+在 `ModelGeometry` 里，不是 `layer.cpp` 里，也不是测试里 —— 阶段 0 的教训。第二份副本
+在测试里等于**什么都没锁**（我的第一版变异脚本就栽在这：改源文件而测试跑的是自己的副本，
+3 个变异里 1 个"存活"，其实是根本没测到）。
+
+#### 已经验证的
+
+- 完整 CUDA 构建 0 error，`strata-device --selftest` 通过
+- 5 个 CPU 测试全绿（新增 `dense_ffn_test`）
+- 3 类变异全被抓住：
+  - `ffn_width` 退回 `n_ff` → CAUGHT
+  - `ffn_width` 无条件用 `dense_ffn`（MoE pack 归零，FPE）→ CAUGHT
+  - `ffn_width` 无条件用 `n_ff != 0 ? ... ` → **第一次存活**，补了"稠密 pack 带着残留
+    `n_ff = 640`"的夹具才抓住。这个夹具是真的会发生的：`has_moe()` 看的是 `n_expert == 0`，
+    而 `n_ff` 是 metadata 里剩下的那个数。
+
+#### 还没验证的（阶段 4 的真正剩余工作）
+
+**没有任何真实 Qwen3.8-27B 权重被加载过。** 上面锁的是算术和分支，不是数值。稠密 FFN 的
+GEMV 在 17408 宽下的正确性、`expert_source` 的 mmap/CPU fallback 是否真的扛得住 178 MB/层，
+都要等阶段 5（GGUF 量化）之后才能实测。
 
 ### 阶段 5：量化格式（未评估，可能最大）
 
