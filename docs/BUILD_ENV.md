@@ -32,7 +32,7 @@ cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcublas-dev-12-9 cuda-cccl-12-9
 # keyring 装一次，之后 apt 自己管；不用 trusted=yes 绕签名
 cd /tmp && curl -sSLO https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update
-sudo apt-get install -y --no-install-recommends \
+sudo apt-get install -y --no-install-recommends \\
   cuda-nvcc-12-9 cuda-cudart-dev-12-9 libcublas-dev-12-9 cuda-cccl-12-9 cmake ninja-build
 ```
 
@@ -40,6 +40,22 @@ sudo apt-get install -y --no-install-recommends \
 而 WSL 的内核模块由 Windows 驱动提供，dkms 装不了也没用。
 
 Debian 官方源只有 `nvidia-cuda-toolkit` 11.8 —— **不够**，必须走 NVIDIA 自己的 repo。
+
+### cmake 要换掉 apt 的
+
+apt 的 cmake 3.25 **不认** nvcc 12.9 的 `CUDA20` dialect，configure 直接报
+`requires the language dialect "CUDA20"`（7 个 target 全挂）。
+
+用 Kitware 官方二进制（一个 tar，无依赖，55 MB）：
+
+```bash
+curl -sSL -o /tmp/cmake.tar.gz \\
+  https://gh-proxy.com/https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz
+tar -xzf /tmp/cmake.tar.gz -C /opt && mv /opt/cmake-3.31.6-linux-x86_64 /opt/cmake
+```
+
+项目自己只要 3.24（`cmake_minimum_required`），但要认 nvcc 的 C++20 dialect 得 3.28+。
+
 
 ## 用的时候
 
