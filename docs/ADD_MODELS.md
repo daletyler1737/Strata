@@ -1,0 +1,186 @@
+# Strata 加新模型：Qwen3.8-27B / Qwen3.6-35B-A3B 改造清单
+
+> 基于 Strata main 分支（2026-10 拉取，852 文件）。配置数据来自 hf-mirror 的 `config.json`，
+> 不是凭记忆。几何映射用 `tools/geometry_from_config.py` 生成，自检 `python tools/geometry_from_config.py`。
+>
+> **结论先说**：Strata 不是通用推理框架，是一个为 `Qwen3.8-Flash-Next`（`model_type: qwen4_exp_text`）
+> 写死的引擎。`include/strata/core/layout.hpp` 的 `ModelGeometry` 是唯一几何来源，
+> `src/core/layout.cpp::check_layer()` 在**加载时**逐张量断言名字+shape+量化格式。
+>
+> 好消息：这两个目标模型都比 Flash-Next **少**两套子系统（gated residual、QSA indexer、PLE n-gram），
+> 所以工作量是「删路径 + 换几何」，不是「写新引擎」。
+
+---
+
+## 1. 三方几何对照
+
+数据来源：`hf-mirror.com/Qwen/<repo>/raw/main/config.json` → `text_config`。
+
+| 字段 | Flash-Next（Strata 已支持） | Qwen3.8-27B | Qwen3.6-35B-A3B |
+|---|---|---|---|
+| `model_type` | `qwen4_exp_text` | `qwen3_5_text` | `qwen3_5_moe_text` |
+| `architectures` | — | `Qwen3_5ForConditionalGeneration` | `Qwen3_5MoeForConditionalGeneration` |
+| hidden_size (n_embd) | 2560 | **5120** | **2048** |
+| num_hidden_layers | 48 | **64** | **40** |
+| full_attention_interval | 4 | 4 | 4 |
+| 层分布（linear/full） | 36 / 12 | **48 / 16** | **30 / 10** |
+| num_attention_heads | 24 | 24 | **16** |
+| num_key_value_heads | 2 | **4** | 2 |
+| head_dim | 256 | 256 | 256 |
+| linear_num_key_heads | 16 | 16 | 16 |
+| linear_num_value_heads | 48 | 48 | **32** |
+| linear_value_head_dim (state) | 128 | 128 | 128 |
+| linear_conv_kernel_dim | 4 | 4 | 4 |
+| num_experts | 512 | **无（稠密）** | **256** |
+| num_experts_per_tok | 10 | — | **8** |
+| moe_intermediate_size (n_ff) | 640 | —（用 intermediate_size 17408） | **512** |
+| shared_expert_intermediate_size | 640 | — | **512** |
+| hc_count / hc_lowrank | 4 / 320 | **无** | **无** |
+| indexer_n_heads / head_dim | 4 / 128 | **无** | **无** |
+| ngram_size (PLE) | 3 | **无** | **无** |
+| attn_output_gate | 无显式字段 | **True** | **True** |
+| output_gate_type | sigmoid | **swish** | 无 |
+| vocab_size | 248320 | 248320 | 248320 |
+| max_position_embeddings | 262144 | 262144 | 262144 |
+| mtp_num_hidden_layers | 1 | 1 | 1 |
+| partial_rotary_factor | 0.25 | 0.25 | 0.25 |
+| vision_config | 有（27 层，1152） | 有（out_hidden_size **5120**） | 有（out_hidden_size **2048**） |
+
+三个模型**都是多模态**（`image_token_id` / `video_token_id` / `vision_config`），
+GDN 线性注意力 + 每 4 层一次全注意力 + MTP 投机解码 —— 这一层 Strata 的实现**可以复用**。
+
+---
+
+## 2. 架构耦合点在哪（实测扫描，非估计）
+
+按子系统统计全仓命中（排除 `third_party/ sycl/ bench/`）：
+
+| 子系统 | 命中 | 热点文件 |
+|---|---:|---|
+| MoE experts | 1537 | `src/program/generate.cpp`(269)、`src/core/expert_source.cpp`(148)、`src/kernels/cuda/router_top10.cu`(94)、`src/core/expert_cache.cpp`(45)、`src/prefill/moe_fused.cu`(36) |
+| QSA / indexer | 1160 | `src/core/layer.cpp`(97)、`src/prefill/prefill.cpp`(67)、`src/kernels/cuda/qsa.cu`(90)、`src/core/session.cpp`(80)、`src/kernels/qsa_parity.cpp`(85) |
+| GDN / linear attn | 1112 | `src/core/layer.cpp`(160)、`src/core/verify.cpp`(106)、`src/prefill/kernels.cu`(68)、`src/prefill/prefill.cpp`(50) |
+| PLE / ngram | 658 | `src/program/generate.cpp`(102)、`src/prefill/prefill.cpp`(82)、`src/kernels/ple_parity.cpp`(84)、`src/kernels/cuda/ple.cu`(31) |
+| gated residual (hc_/gr_) | 487 | `src/kernels/cuda/gr.cu`(77)、`src/kernels/cuda/fused_gr.cu`(40)、`src/core/layer.cpp`(28)、`src/kernels/gr_parity.cpp`(65) |
+| shared_expert | 156 | `src/kernels/cuda/shared_expert.cu`(24) |
+
+`ModelGeometry` 出现在 18 个文件、共 200+ 处引用。
+
+硬编码常量：
+
+| 常量 | 位置 | 影响 |
+|---|---|---|
+| `n_expert = 512` | `include/strata/core/layout.hpp:47`（唯一一处定义） | 好消息：几何已经是 struct，改默认值即可 |
+| `24576`（48×512 专家总数） | `src/program/generate.cpp`、`src/kernels/decode_cluster_parity.cpp` | 要改成 `n_layers × n_expert` 计算 |
+| top-10 router | `src/kernels/cuda/router_top10.cu`(28处)、`include/strata/kernels/router_top10.hpp` | 函数签名已带 `n_expert`/`k` 参数，**但文件名和 kernel 名写死 top10**；内部固定 10 专家布局需确认 |
+| `2560` | 69 个文件 229 处 | 多数是 kernel 里的 tile 常量或测试数据，**逐个核对**，不能全局替换 |
+
+---
+
+## 3. 分阶段改造
+
+### 阶段 0：几何参数化（半天，机械）
+
+`ModelGeometry` 已经是 struct，`check_layer()` 已经按它断言。所以：
+
+```bash
+python tools/geometry_from_config.py bench/q38_27b.json   # 打印可直接粘贴的 C++ 块 + 待办清单
+python tools/geometry_from_config.py bench/q36_35b.json
+```
+
+改 `include/strata/core/layout.hpp` 默认值 + 把 `24576` 改成 `g.n_layers * g.n_expert`。
+
+**但这不是「加个模型」** —— `ModelGeometry` 只是契约，kernel 还得能用这些数字算。
+
+### 阶段 1：干掉 QSA indexer（2–3 天）
+
+两个目标模型**都没有** `indexer_*` / `hc_*` / `ngram_*` 张量。`check_layer()` 会直接报
+`missing blk.N.indexer.q_proj.weight`。
+
+改动：
+1. `Want2[]` 里把 `indexer.q_proj` / `indexer.k_proj` 标成 `qsa_only` 之外的可选项（或加 `bool required`）
+2. `src/core/layer.cpp` 的 QSA 层路径改成 `native_flash_attn.cu` 的全注意力（这个 kernel 已经在，因为 MTP 层用它）
+3. `include/strata/kernels/qsa.hpp` + `qsa.cu` + `qsa_select.cu` + `qsa_prompt_attn.cu` 对这两个 pack 是死代码 → 用 `#if` 或运行时分支跳过
+4. `src/plan/plan.hpp` 的显存预算公式要重算（没有 indexer key store，但多了 full attention 的 KV）
+
+**省的部分**：`check_layer` 里那些「indexer.head_count 计数错」的注释说明这块代码本身有历史 bug，
+少一套少一份风险。
+
+### 阶段 2：干掉 gated residual（1 天）
+
+`hc_count`/`hc_lowrank` 都不存在 → 6 个 `hc_*` 张量全删。
+`gr.cu`(77 命中) / `fused_gr.cu`(40) / `gr_parity.cpp`(65) / `include/strata/kernels/gr.hpp`
+对这两个 pack 是死代码。
+
+注意：`gr_*` 在 `prefill/kernels.cu` 里也占 10 处、`ple.cu` 占 45 处 —— 说明 **PLE 和 GR 在
+prompt 路径里是耦合的**，删 GR 要连带看 PLE。
+
+### 阶段 3：MoE 参数化（Qwen3.6-35B-A3B 专用，3–5 天）
+
+Qwen3.6-35B-A3B 仍是 MoE（256 专家 / top-8 / n_ff=512），结构同族，改动相对小：
+
+- `router_top10.cu` 的 top-10 假设要参数化（256 专家 top-8）。签名已有 `k` 参数，重点是 kernel 内部的 warp 布局
+- `s2_gemv` 系列（`s2_gemv.cu` / `s2_gemv_fast.cu` / `s2_gemv_q8.cu` / `s2_expert_grouped.cu`）是 Q2_0/IQ 的
+  专用 dequant+GEMV，n_ff 从 640 变 512 → 重新 tune tile
+- `expert_source.cpp`(148 命中) / `expert_cache.cpp` / `peer_experts.cpp` 的 expert 寻址是
+  `layer * 512 + expert` 的扁平索引 → 改成 `layer * n_expert + expert`
+- `prefill/moe_fused.cu` / `moe_mmq.cu` / `moe_fused_iq.cu` 的 group 尺寸要重算
+- `plan/plan.hpp` 显存预算：专家总数从 24576 降到 10240，**缓存能多装一倍专家 → 会更快**
+
+Qwen3.8-27B **没有 MoE**，走阶段 4。
+
+### 阶段 4：稠密 FFN（Qwen3.8-27B 专用，2–3 天）
+
+27B 是**稠密模型**，`intermediate_size = 17408`（vs shared_expert 的 640）。
+Strata 里没有稠密 FFN 的 GEMV 路径 —— `shared_expert.cu` 是最近的那个，但它的 shape 是
+`[n_embd, n_ff] → [n_ff, n_embd]`，n_ff=17408 时：
+- 显存：17408×5120×2 bytes = 178 MB/层 × 64 层 = **11.4 GB 常驻**，放不进 6 GB 显存，
+  得走 `expert_source` 的 mmap + CPU fallback（和现在专家一个待遇）
+- `intermediate_size` 是 MoE 前缀的稠密 FFN，还是全层都有？**这个必须去 model.safetensors.index.json
+  里查真实的张量名**，config.json 没写 `first_k_dense_replace` / `moe_layer_freq`
+
+### 阶段 5：量化格式（未评估，可能最大）
+
+Strata 走 **GGUF i-quant**（从 llama.cpp 抄的 dequant），量化产物是
+`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` 家的 GSQ-RCO。
+
+而 `Qwen3.6-35B-A3B-NVFP4` 你手上那个是 **NVFP4 / MXFP4**（Blackwell tensor-core 原生格式）。
+这两套**没有转换路径**，需要：
+- 要么用 `unsloth` 的 GGUF 重新量化目标模型（多一步，但复用 Strata 现有 dequant）
+- 要么给 Strata 加 NVFP4 dequant（`src/artifact/dequant.cpp` 重写，且 `nvfp4` 需要 sm_100+，
+  你的 RTX 3060 是 sm_86，**硬件就不支持**）
+
+**建议**：一律走 GGUF 路线，别碰 NVFP4。
+
+### 阶段 6：多模态（可选）
+
+三个模型都有 `vision_config`。Strata 用 llama.cpp 的 `mtmd`（`tools/vision/strata_vision.cpp`）。
+`out_hidden_size` 变了（5120 / 2048），`tools/embd_bf16_pack.py` 和
+`src/core/native_head.cpp` 的投影维度要跟着改。
+
+---
+
+## 4. 硬件现实
+
+| | 需要 | 你有（实测 nvidia-smi） |
+|---|---|---|
+| 显存 | ≥ 12 GB（官方最低档） | **6 GB**（RTX 3060 Laptop, 6144 MiB） |
+| 内存 | ≥ 32 GB | 39.8 GB ✓ |
+| 磁盘 | 66–76 GB 下载 | E 盘 389 GB ✓ |
+
+**改造完你也跑不起来原版 Flash-Next。** 但改造完的 Qwen3.6-35B-A3B（A3B = 每 token 只激活 3B）
+在 6 GB 显存 + GGUF Q4 下理论可跑 —— 前提是阶段 1–3 全做完。这才是「值得改造」的那一个。
+Qwen3.8-27B 是稠密 27B，6 GB 显存跑不动，改造它主要是为了架构验证（不需要 GPU 正确性，
+可以用 CPU parity 测试）。
+
+---
+
+## 5. 建议路线
+
+1. **先做 Qwen3.6-35B-A3B**（MoE 同族，改动最集中，且 6 GB 显存可能真跑得动）
+2. 阶段 0 + 1 + 2 + 3 全部完成后，用 `python tools/geometry_from_config.py` 的 `--check` 输出当验收清单
+3. Qwen3.8-27B（稠密）等 MoE 那套稳了再上，它主要验证「没有 MoE 时 Strata 的代码路径能不能退化成稠密」
+4. **跳过 NVFP4**，走 GGUF
+
+> ponytail: 没写 `docs/` 以外的任何东西，因为现在写 C++ 就是写一堆跑不起来的 kernel。
+> 先把「哪些文件要动、动的顺序、验收信号」钉死，比提前写 3000 行编译不过的 CUDA 值钱。
