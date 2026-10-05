@@ -355,26 +355,38 @@ blob = per[0] + per[1] + per[2]
 
 `sycl/` 是 CUDA 的镜像目录，改 CUDA 必须同步改 SYCL，否则两份行为分叉。
 
-#### 已确认的一个真缺口（不是全部）
+#### 已修：`g0` —— 两处，比看起来重要
 
-`src/program/generate.cpp:1996` 用**默认构造**的几何去加载专家 layout：
+`generate.cpp` 里有**两处**默认构造的几何，都在 `read_geometry` 之前约 80 行：
 
 ```cpp
-const strata::core::ModelGeometry g0;                                  // = Flash-Next: 48 层 / 512 专家
-if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err))
+const strata::core::ModelGeometry g0;                    // = Flash-Next: 48 层 / 512 专家 / 2560 宽
+expert_layout_load(o.pack, g0.n_layers, g0.n_expert);   // (1) 编进 blob_bytes()
+native_embed.load(..., g0.n_embd, 248320);              // (2) 加上字面词表
 ```
 
-而 GGUF 到 **L2077** 才打开、L2082 才 `read_geometry`。**顺序反了** —— 加载 layout 时拿不到真几何。
+**为什么症状是"看起来对的错数字"**：canonical Q2_0 分支没有元数据兜底，qwen35moe 的 pack 按 48×512
+排布，arena 大 25% —— 但它仍然是个合法的 arena。所以第一个症状不是报错，是一个合理但错误的数。
 
-- **native（IQ）路径：已经安全。** `expert_layout_load` 从 `native_experts.txt` 头读
-  `(n_expert N, ...)`，注释明写"a pruned model ships fewer experts than the canonical geometry the caller
-  passes, which is a compile-time default, so the header wins"。调用方传错也无所谓。
-- **canonical（Q2_0）路径：有洞。** 没有 `native_experts.txt`，`!in` 分支直接用调用方的
-  `n_layers / n_expert / BLOB`。`experts.bin` 是纯字节流，无元数据可反推。
+**改法**（`5f97543`）：把 layout 加载 + 格式校验 + PCIe 分支 + AVX-512 检查整块移到 `read_geometry`
+之后，`g0` → `g`。PCIe/AVX-512 只依赖 `native_pack`（一个 bool），跟着走即可。
 
-所以 Qwen3.6-35B 走 Q2_0 会用 512 专家 / 2560 宽去解释一个 256×64×2048 的 blob。
-修法不是传参（拿不到），是**把 layout 加载移到 `read_geometry` 之后**，或给 canonical 路径补一份
-manifest。这一步要先动启动顺序，属于阶段 5 的产物侧。
+词表不是几何字段，没有真值可传。lazy 修法：`NativeHead::load` 的 `n_out <= 0` 表示"从
+`output.weight` 自己的 shape 读"——张量本来就在那儿读。`n_out > 0` 时仍交叉校验。
+
+#### canonical 路径没有模型 GGUF 参数（设计如此，不是 bug）
+
+```
+--pack DIR     the pack directory
+--tokens-file PATH
+--ple-gguf PATH
+```
+
+`strata generate` 接受路径的只有这三个，`GgufFile` 也只从这三处打开。canonical 路径**没有模型
+文件**，所以 `g` 在 canonical 下只能取编译期默认值 —— 那不是漏读，是唯一可得的来源。
+
+本轮改动让 native 路径正确，canonical 行为不变。要让 canonical 也支持别的模型，得给
+`generate` 加一个模型 GGUF 参数，那是新功能，不在阶段 3 范围。
 
 **2. decode 路径已有守卫但也有硬编码**（`src/core/layer.cpp` / `verify.cpp`）：
 
