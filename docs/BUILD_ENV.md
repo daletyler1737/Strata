@@ -73,3 +73,22 @@ WSL 继承 Windows 的 PATH（含空格和括号），任何内联 `bash -c '...
 - nvcc 12.9.86 ✓ / cmake 3.25.1 ✓（要求 3.24）/ ninja 1.11.1 ✓ / g++ 12.2.0 ✓
 - `third_party/ggml` 空 —— llama.cpp 需按 `setup.py` 的 `LLAMA_CPP_COMMIT` 拉（GitHub 直连通，39.5 MB）
 - 完整 CMake 构建未跑
+
+
+## 从 Windows 主机驱动 WSL（本机实测的坑）
+
+从 git-bash 或任何 Windows 进程调 `wsl.exe` 时，命令行会先过一遍 Windows 的解析：
+
+- **shell 变量会被吃空。** `wsl.exe -- bash -c 'X=1; echo $X'` 打印空 — `$X` 在到达
+  WSL 前就被当成了 Windows 环境变量。**写死完整路径**，不要在跨边界的命令里用 `$VAR`。
+  同理 `sed -n '1,5p;7,9p'` 的分号和 `grep 'foo('` 的括号都会被吃掉。
+- **中文目录名会损坏。** `mkdir -p "模型"` 在跨边界时建成乱码目录（实测 `妯″瀷`），
+  curl 会照着那个乱码路径写。**长任务用 ASCII 路径**；已经建错了就 `shutil.move` 到正确位置
+  （curl 的 `-C -` 可以从断点续传，不会浪费已下的部分）。
+- **`subprocess` 传 `input=` 给 git 会挂死。** `git commit` 等 stdin 时若 stdin 是管道，
+  进程等的是 EOF 而不是你的文本。**提交信息写文件，用 `git commit -F <file>`。**
+- **单次命令有 300 秒上限。** ctest 全量、`cmake --build` 这类长任务要放到后台跑并落盘日志，
+  不要在前台等。
+
+已经踩过的具体现场：Qwen3.6-35B-A3B 的 IQ2_XXS（9.94 GB）从 hf-mirror 下载时，
+目录名乱码导致文件落在错误路径，中途还要 `mv` 回正确位置再续传。
