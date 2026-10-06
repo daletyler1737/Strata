@@ -1779,6 +1779,9 @@ int main(int argc, char** argv) {
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
     strata::core::layer_set_shared_early(!o.shared_late);
+    // --native was parsed without a --ple-gguf.  Whether that is fatal depends on the architecture, which is
+    // only known once the model file's geometry has been read; decided there, not here.
+    bool native_needs_ple_check = false;
     if (!o.native_preset.empty()) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
@@ -1796,9 +1799,16 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (o.no_ple || o.ple_gguf.empty()) {
-            std::fprintf(stderr, "strata generate: --native requires --ple-gguf (the PLE key is native too), and no "
-                                 "shard of the model holds per_layer_token_embd.weight\n");
-            return 2;
+            // Whether a PLE table is REQUIRED is not known here: it depends on the architecture, and the
+            // architecture is read from the model file 200 lines below.  A qwen35moe model has no PLE layer at
+            // all - has_ple() is false - so for it --no-ple is the only correct answer and demanding
+            // --ple-gguf makes the two requirements mutually exclusive and the pack unloadable.
+            //
+            // So this only records that none was given; whether that is fatal is decided against the
+            // architecture in read_native_preset(), after the geometry is known.  ponytail: Flash-Next is the
+            // only family with a PLE, so until a second one appears this is "if the model has no PLE, drop the
+            // PLE flags and carry on".
+            native_needs_ple_check = true;
         }
         o.stream_token = true;
         o.gr_native_mmvf = true;
@@ -1831,7 +1841,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --no-ple and --ple-gguf are mutually exclusive\n");
         return 2;
     }
-    if (o.native_ple_postops && o.no_ple) {
+    // A PLE-less model clears native_ple_postops together with the other PLE flags once the architecture is
+    // known, so this cannot be decided yet: --native sets the flag 40 lines above and the architecture is 200
+    // lines below.  Checked there instead, next to the read_geometry block.
+    if (o.native_ple_postops && o.no_ple && !native_needs_ple_check) {
         std::fprintf(stderr, "strata generate: --native-ple-postops requires PLE enabled\n");
         return 2;
     }
@@ -1940,7 +1953,9 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (o.native_ple_key && (o.native_dense_gguf.empty() || o.no_ple)) {
+    // Same deferral as the ple-postops check above: a PLE-less model clears native_ple_key after the
+    // architecture is read, so demanding --native-dense-gguf here would refuse a pack that runs fine without it.
+    if (o.native_ple_key && (o.native_dense_gguf.empty() || o.no_ple) && !native_needs_ple_check) {
         std::fprintf(stderr, "strata generate: --native-ple-key requires PLE and --native-dense-gguf\n");
         return 2;
     }
@@ -2077,6 +2092,29 @@ int main(int argc, char** argv) {
                              (long long) g.n_head, (long long) g.n_head_kv, (long long) g.head_dim,
                              (long long) g.n_expert, (long long) K, (long long) g.ffn_width(),
                              (long long) g.ssm_state_size);
+                // **A MODEL WITH NO PLE LAYER RUNS WITH --no-ple, AND --native MUST NOT PREVENT THAT.**
+                //
+                // --native sets native_ple_key and native_ple_postops, and used to require --ple-gguf outright.
+                // But PLE is Flash-Next's subsystem: qwen35moe's geometry has no PLE layer at all, so for it
+                // --no-ple is the only correct flag and the two requirements were mutually exclusive - the pack
+                // could be loaded, pass every layout check, and still be unrunnable.
+                //
+                // So: a model without a PLE drops the PLE-specific native flags and runs.  A model with one still
+                // has to be given the table, because there the flags would otherwise read from nothing.
+                if (native_needs_ple_check) {
+                    if (g.has_ple()) {
+                        std::fprintf(stderr, "strata generate: --native requires --ple-gguf for %s (the PLE key is "
+                                             "native too), and no shard of the model holds per_layer_token_embd.weight\n",
+                                     arch ? arch->s : "this model");
+                        return 2;
+                    }
+                    o.native_ple_key = false;
+                    o.native_ple_postops = false;
+                    o.native_qsa_indexer = false;      // the QSA indexer reads the PLE table
+                    std::fprintf(stderr, "strata generate: %s has no PLE layer: --native runs it with the PLE "
+                                         "flags off and --no-ple\n",
+                                 arch ? arch->s : "this model");
+                }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
                              o.native_preset.c_str(), e.what());
