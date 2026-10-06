@@ -561,3 +561,126 @@ echo "/usr/lib/wsl/lib" > /etc/ld.so.conf.d/wsl-cuda.conf && ldconfig
 `libcuda.so` 不在 ld 搜索路径，仅此而已。修好后 PCIe 带宽 7.5 → **17.8 GB/s**。
 `compute_cap 8.6` 对上 CMake 的 `CMAKE_CUDA_ARCHITECTURES=86`。**先 `nvidia-smi` 再下结论。**
 
+
+
+## 2026-10-06 实测：真实权重加载全通，verify 卡在 Flash-Next 专属机制
+
+**这一节全部是真实运行的日志，不是推断。** 上一节说「还没做任何一次真实 token 的前向」，
+本节把会话真正跑到了 `session is up`，并定位了剩下的墙。
+
+### 走通的（真实 GGUF，`Qwen_Qwen3.6-35B-A3B-IQ2_XXS.gguf`, 10676139648 B）
+
+```
+strata generate: geometry: 41 layers, n_embd 2048, 16 heads/2 kv, head_dim 256,
+                256 experts top-8, ff width 512, ssm 128
+strata generate: has no PLE layer: --native runs it with the PLE flags off and --no-ple
+strata generate: native pack: experts (largest blob 3.34 MB),
+                token embedding Q2_K in mapped host memory (159 MiB)
+strata generate: 53 MiB of weights loaded (260 canonical tensors skipped: served natively)
+strata generate: 258 native projection matrices, 769.72 MiB of weights
+strata generate: experimental native Q5_K head, 349634560 bytes
+strata generate: GPU 0: NVIDIA GeForce RTX 3060 Laptop GPU, compute capability 8.6
+strata generate: expert arena: cudaHostRegister PORTABLE ok
+strata generate: loaded 8.60 GiB at 1.22 GiB/s
+strata generate: expert cache auto: 3.42 GiB free, 700 MiB reserved -> 721 slots
+strata generate: pre-filled 721 of 721 slots from the profile; slot 0 verified
+strata generate: session is up (engine 0.1.39)
+```
+
+`159 MiB` 与 `2048 x 248320 x 84 / 256` 分毫不差（Q2_K 的 84 B / 256 值），
+`8.60 GiB` 与 pack 声明一致，721 个 slot 全部预填并校验了 slot 0。
+**Q2_K 的尺寸仍然只是尺寸，不是数值**——见上面的验证计划。
+
+### 修掉的一个真 bug：`spec_pos` 哨兵值撞车
+
+单token 提示时 `strata` 返回**空输出且不报错**。原因在 `src/program/generate.cpp`：
+
+```cpp
+int64_t spec_pos = 0;                          // 0 = 「投机循环不用」
+...
+for (int64_t pos = pos_start;; ++pos) {
+    if (native_pack) { spec_pos = pos; break; } // 单 token 提示 pos == 0 -> 写成 0
+...
+if (spec_pos > 0 && ...) { /* 投机循环 */ }    // 0 不满足 -> 整个跳过
+```
+
+native pack 的 prompt token 不直接 decode（它作为 verify window 的起点），所以循环第一轮
+就 break；`pos == 0` 时 `spec_pos` 恰好等于「不用」的哨兵值，投机循环被跳过，
+`produced` 为空，于是 0 token 且无任何错误。改成 `spec_pos = pos + 1`（与另一处赋值
+`spec_pos = pos + 1` 语义一致：verify window 从 prompt 最后一个 token **之后**开始）。
+
+改之前所有调参尝试（`--spec`、`--prefill`、`--expert-cache`）都无效，正是因为真正的
+bug 在更前面把整个循环短路了。**遇到静默失败，先怀疑控制流，再怀疑配置。**
+
+### 剩下的墙：`verify` 与 `prefill` 整块按 Flash-Next 写死
+
+修复哨兵 bug 后循环真的进去了，随后暴露出本来被掩盖的问题：
+
+```
+verify: the native QSA indexer is off (the verify window reproduces the default native decode path)
+```
+
+三处Flash-Next 的架构假设，**都不是运行时开关能解的**：
+
+| 位置 | 写死的东西 | Qwen3.6 实际 |
+|---|---|---|
+| `src/prefill/prefill.cpp:90` | `constexpr N=2560, HC=4, K=10, NE=512, C=10240, ZV=6144, HV=48` | `n_embd=2048, top-8, 256 专家, ff=512` |
+| `src/core/verify.cpp:329` | `ss.k != 10 \|\| g.ssm_state_size != 128 \|\| g.ssm_d_conv != 4` | `top-8` |
+| `src/core/layer.cpp:536` | 要求 `native_qsa_indexer_enabled()` | Qwen3.6 用 `full_attention_interval=4` 的混合注意力，无QSA indexer |
+
+`prefill.cpp` 那些是**编译期常量**（`constexpr`），且 `C=10240` 与 Qwen3.6 的 `ff=512`
+差 20 倍，不是填个数的事：它们参与 MMQ ring 布局、`bytes_needed` 的显存估算和多处
+静态断言。`verify.cpp` 的 `QsaShapes`/`shapes_of()` 同理。
+
+`layer_verify_compatible()` 的意图是对的：verify window 必须与 decode 路径**逐位一致**，
+否则投机解码产出的 token 就是错的。所以**不能简单关掉 QSA 检查**——那会让 verify 和
+decode 算术不一致，比不出 token 更糟。
+
+**结论：要支持 Qwen3.6，需要为它写一套 prefill + verify 实现，替换现有 Flash-Next 专用
+代码。这是独立的大工程，不是配置问题。**
+
+### 需要的额外输入：一个 `--expert-profile`
+
+生成模式下 `--spec` 要求 device residency table（`thits.d_res`），而 `graph_hits` 的条件是
+`hit_fn != nullptr && !profile.empty() && !o.no_pool`（`generate.cpp:4357`）。
+`--expert-cache auto` 会建cache 但**不产生 profile**，profile 只由 `--serve` 学出来。
+一个手工构造的 `profile.bin`（格式见 `src/core/expert_cache.cpp:23-78`）能立刻解锁：
+
+```
+STRP + uint32[5]{version, n_layers, n_expert, want_slots, n_ranked}
+      + uint16 x n_ranked x 2  (layer, expert) 交错
+```
+
+注意：**顺序填充的 profile 只证明路径通了，不证明数值对**——常驻的是哪 721 个专家
+由内容决定，真实 profile 需要跑一段对话统计路由频率。
+
+### tok/s：**零实测**
+
+一个真实 token 都没产出，所以**没有任何 tok/s 数字**。本节日志里的
+`16.2 GB/s`（PCIe probe，跨轮 4.8–16.2 波动，噪声大）、`1.22 GiB/s`（专家池加载）
+`2.24 GiB / 721 slots`（显存占用）**都不是 tok/s**。
+
+上一节给的「理论15 tok/s 上限」「40 tok/s 需要双通道 + attention 降到 IQ2」都是
+**按内存带宽算的估算，零实测支撑**。硬件前提（RTX 3060 Laptop 6 GB、
+40 GB DDR4 2667 单通道）已实测确认，但带宽数字随运行波动，不能当定论。
+
+### 本机存储布局（实测，之前误判过一次）
+
+```
+E: -> disk1 CF700 1TB           NVMe
+C: -> disk2 SKHynix 512G        NVMe
+F: -> disk0 TOSHIBA MQ04ABD200  SATA HDD   <- WSL 原先在这里
+```
+
+WSL 的 vhdx 原在 `F:\wsl\debian`（机械盘），已用
+`wsl --manage debian-bookworm --move "E:\wsl\debian"` 迁到 NVMe，
+`F:\wsl` 已清空，迁移后 WSL 启动正常、仓库与两个 pack 完好、CUDA 仍可用。
+
+**曾误判「模型文件也在机械盘上」——错的**：GGUF 一直在 `E:`（NVMe）。
+真正在机械盘上的只有 WSL 本身（含 `/tmp` 里的 `experts.bin`）。
+
+### 一个必须记住的坑：二进制比源码旧
+
+`/tmp/strata-build/strata` 的时间戳是 09:47，而源码修复在 10:08 之后，
+于是**连续三轮「验证」跑的全是旧二进制**，改对了代码却看不到变化，
+错误信息也一模一样。每次改源码后必须 `ninja strata` 再跑，否则白测。
