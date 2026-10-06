@@ -7663,8 +7663,11 @@ int main(int argc, char** argv) {
     }
 
     for (int64_t pos = pos_start;; ++pos) {
-        // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
-        if (native_pack) { spec_pos = pos; break; }
+        // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1).  The window
+        // starts AFTER it, so this is pos + 1: spec_pos == 0 is the "not used" sentinel (see its declaration),
+        // and a one-token prompt put pos == 0 there, which read as "the speculative loop is off" and returned an
+        // empty output with no error at all.
+        if (native_pack) { spec_pos = pos + 1; break; }
         if (pos >= o.max_context) {
             std::fprintf(stderr, "strata generate: ran out of context at position %lld\n", (long long) pos);
             return 2;
