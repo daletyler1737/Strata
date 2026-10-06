@@ -513,7 +513,51 @@ down_off`，把三矩阵分开记零拷贝偏移。第 40 层的 `gu_type/d_type
 16/17（IQ2_XS / IQ2_XXS）—— **层间量化类型不一致**，v3/v4 表表达不了。所有 41 层的区块都在文件内，
 最紧的第 40 层余 2.12 GiB。
 
-还没做：任何一次真实 token 的前向。WSL 里没有 GPU（`nvidia-smi` 不存在），而 `--native-bf16` /
-`--native-gdn` / `--native-router` 全部标注 CUDA-oracle，**没有 CPU native 推理路径**；真推理只能在
-Windows + RTX 3060 Laptop 6 GB 上靠 `--expert-cache N` 的 CPU 专家池 offload。
+### 阶段 4：真实文件走到哪了（2026-10-06）
+
+真实 `Qwen_Qwen3.6-35B-A3B-IQ2_XXS.gguf`（10 676 139 648 B）跑 `strata --pack ... --native`，依次修掉
+六个各自独立的阻塞，每一个都由当时的运行日志确认，不是推断：
+
+| 症状 | 根因 |
+|---|---|
+| `--ple-gguf is required` | `--native` 无条件设 `native_ple_key` 并强制要 PLE 表；qwen35moe 没有 PLE 层 |
+| `native dense: cannot open ` | 把空 `ple_gguf` 推进 dense 列表，served_names 开了零长度路径 |
+| `token_embd.weight is absent...`（词表） | 调用方传 `n_vocab=0`，注释说会从文件读，`NativeEmbed::load` 却没读 |
+| 同上（类型） | 真实文件 `token_embd.weight` 是 **Q2_K**（type 10），`dq_q2_k` 根本不存在 |
+| `cudaMemcpy failed for ...nextn.eh_proj` | native 行被填了 `dst_bytes`，引擎去读从未写过的 pack 偏移 |
+| `tensor absent from canonical table: ...nextn.enorm` | 1 维 MTP norm 被 `eligible()` 收进 skip，但 pack 里没有它 |
+
+现在的日志停在这里：
+
+```
+geometry: 41 layers, n_embd 2048, 16 heads/2 kv, head_dim 256, 256 experts top-8, ff width 512, ssm 128
+has no PLE layer: --native runs it with the PLE flags off and --no-ple
+PCIe probe: 9.6 GB/s host->device
+native pack: experts (largest blob 3.34 MB), token embedding Q2_K in mapped host memory (159 MiB)
+53 MiB of weights loaded (260 canonical tensors skipped: served natively)
+```
+
+**还没做：任何一次真实 token 的前向。** 因此 Q2_K 反量化的**数值正确性未验证**——
+kernel 编译通过、`159 MiB` 与 `2048 x 248320 x 84 B / 256` 分毫不差，但尺寸对不等于值对。
+`iq_dequant_f32` 已可作为 CPU 侧对比入口，验证路径：拿真实 GGUF 里几个 Q2_K 超块，同时跑
+`dq_q2_k` 与 ggml 上游 `dequantize_row_q2_K`，逐值比。
+
+硬件前提（本机实测）：RTX 3060 Laptop **6 GB**，权重 9.94 GiB + 专家池 8.60 GiB，内存带宽
+15.1 GB/s（单通道 DDR4）。6 GB 装不下，必然 CPU 专家池 offload；**40 tok/s 在这个配置下不可能**
+（每 token 25 ms 需要远超 15.1 GB/s 的带宽），现实区间是个位数。唯一能改变天花板的硬件动作
+是加同规格内存条组双通道。
+
+#### WSL 里其实有 GPU（一个反复误判的坑）
+
+曾因 `ls /usr/lib/x86_64-linux-gnu/libcuda.so*` 为空就判定「WSL 没驱动、要装 Windows CUDA、
+也许要 Docker」——**全错**。WSL 用宿主机的驱动，它一直挂载着：
+
+```bash
+nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader
+# NVIDIA GeForce RTX 3060 Laptop GPU, 6144 MiB, 8.6
+echo "/usr/lib/wsl/lib" > /etc/ld.so.conf.d/wsl-cuda.conf && ldconfig
+```
+
+`libcuda.so` 不在 ld 搜索路径，仅此而已。修好后 PCIe 带宽 7.5 → **17.8 GB/s**。
+`compute_cap 8.6` 对上 CMake 的 `CMAKE_CUDA_ARCHITECTURES=86`。**先 `nvidia-smi` 再下结论。**
 
