@@ -32,6 +32,11 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
         ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
+    // A .nextn. block is a multi-token-prediction head; the engine serves these straight from the GGUF (it has
+    // no MTP kernels for them), so the pack must be told to skip them rather than to look for a copy it never wrote.
+    // 2-D only: a 1-D nextn norm is left out of the pack entirely (iq_pack.py skips it) and has no native
+    // reader, so listing it here only made NativeDense look for a tensor that does not exist.
+    if (name.find(".nextn.") != std::string::npos) return tensor.shape.size() == 2;
     return false;
 }
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };

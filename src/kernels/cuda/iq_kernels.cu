@@ -1518,6 +1518,30 @@ __device__ void dq_iq4_xs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
     }
 }
+// ggml's dequantize_row_q2_K (ggml-quants.c), straight from upstream: 256 values per superblock, weight = a*q + b,
+// 16 sub-blocks of 16.  scales[] packs scale in the low nibble and min in the high one.  qs[] holds only 2 bits
+// per value, so unlike Q4_K every byte yields ONE value, taken at a per-sub-block shift of 2*j bits; the 64 bytes
+// are two 32-byte halves (sub-blocks 0-7, then 8-15), each laid out as four pairs of 16-byte groups whose group j
+// carries scales[j] and scales[j+4].
+// 32 threads: two threads per sub-block, 8 values each.
+template<typename dst_t>
+__device__ void dq_q2_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q2_K* x = (const block_q2_K*) vx;
+    const int   b    = tid >> 1;                     // 0..15, the sub-block
+    const int   half = tid & 1;                      // which 8 of its 16 values
+    const int   j    = (b % 8) >> 1;                 // the shift pair
+    const int   par  = (b % 8) & 1;                  // low or high 16-byte group
+    const float dall = __low2half(x[ibs].dm);
+    const float dmin = __high2half(x[ibs].dm);
+    const uint8_t sc = x[ibs].scales[b];
+    const float dl = dall * (sc & 0xF), ml = dmin * (sc >> 4);
+    const int shift = 2 * j;
+    const uint8_t* q = x[ibs].qs + 32 * (b / 8) + 16 * par + half * 8;
+    dst_t* y = yy + (b / 8) * 128 + j * 32 + par * 16 + half * 8;
+    for (int l = 0; l < 8; ++l) {
+        y[l] = cvt<dst_t>(dl * (float) (int8_t) ((q[l] >> shift) & 3) - ml);
+    }
+}
 template<typename dst_t>
 __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     // one "superblock" = 256 values = 4 blocks of 64; thread tid writes 8 values
@@ -1655,6 +1679,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+        case 10: dq_q2_k(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
@@ -1685,7 +1710,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
+           t == 12 || t == 13 || t == 10 || t == 7 || t == 6 || t == 8;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -1794,6 +1819,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);

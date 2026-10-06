@@ -278,14 +278,27 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     for name, (g, t, mm, p) in model.where.items():
         if is_expert(t.name) or t.name in NOT_IN_PACK:
             continue
+        # A .nextn. block is a multi-token-prediction head and the engine has no kernels for it (mtp.cpp knows
+        # only Flash-Next's draft-layer names), so nothing in it is ever read on the generate path.  Its 2-D
+        # tensors are still indexed native below, so a reader that wants them can find them in the GGUF; its 1-D
+        # norms have no form and no native reader, so they are left out rather than failing the whole pack.
+        if ".nextn." in name and len(t.shape) != 2:
+            continue
         if len(t.shape) > 2:
             print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
             return 1
         # quantized: served from the GGUF unless the engine reads it from the pack (FORM), which takes
         # --compat-bf16 to dequantize - except the native PLE key encodings
         form = form_of(name)
-        native = t.type_name not in FLOAT and (form is None or (
-            name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
+        # A .nextn. block is a multi-token-prediction head the engine has no kernels for (mtp.cpp knows only
+        # Flash-Next's draft-layer names), so its tensors can never be served from the pack.  Index them native so
+        # the engine reads them straight from the GGUF: a Q8_0 blk.40.nextn.eh_proj came back as a shape-only row
+        # and refused the whole pack with "this pack holds the tensor only in its GGUF form".
+        # 2-D only: a native row is located by (src_off, src_bytes) and read by the mmvq kernels, which take a
+        # row width.  A 1-D nextn norm has neither, and marking it native left the pack with a row it cannot serve.
+        native = (t.type_name not in FLOAT and len(t.shape) == 2 and (form is None or (
+            name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))) or (
+            ".nextn." in name and len(t.shape) == 2)
         if t.type_name not in FLOAT and not native and not compat_bf16:
             problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
         todo.append((name, g, t, mm, p, native))
@@ -305,7 +318,16 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
             ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
             if native:
                 served += 1
-                rows.append([t.name, "0", "0", "0", "0", "0", "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
+                # Record where the bytes really are.  src_off was hard-wired to 0 and src_bytes to 0, so a native
+                # tensor's row could not be located in its GGUF: a Q8_0 blk.40.nextn.eh_proj came back as a
+                # shape-only row and weights.cpp refused the whole pack with "this pack holds the tensor only in
+                # its GGUF form".  The engine reads these straight from the shard, so it needs the real offset.
+                # Served zero-copy from the GGUF, so there is no pack-side destination: dst_bytes must stay 0,
+                # or weights.cpp cudaMemcpy's from dense.bin at an offset that was never written.  src_off/src_bytes
+                # are what locate the bytes in the shard (they were hard-wired to 0, which made this row
+                # unreadable).  columns: name kind offset dst_bytes src_off src_bytes dst_bytes ne0 ne1 type ...
+                rows.append([t.name, "0", "0", "0", str(g.data_start + t.offset),
+                             str(t.expected_bytes()), "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
                 continue
             raw = tensor_bytes(mm, g, t)
             try:

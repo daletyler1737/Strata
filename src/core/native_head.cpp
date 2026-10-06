@@ -124,6 +124,11 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         size_t at = 0;
         const strata::TensorInfo* t = model.find("token_embd.weight", &at);
         const strata::GgufFile& gguf = model.shard(at);
+        // n_vocab is not a geometry field.  Callers pass 0 to say "read it from the file" - and the shape check
+        // below then compares the tensor against itself, so the vocabulary is taken from token_embd's own dim 1.
+        // (The caller believed this was already what happened; it was not, and every model that is not
+        // Flash-Next loaded with n_vocab 0 and was refused here.)
+        if (n_vocab <= 0 && t && t->shape.size() == 2) n_vocab = (int64_t) t->shape[1];
         if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab ||
             !strata::kernels::embed_type_supported((int) t->type) || n_embd % 256) {
             err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
