@@ -1826,7 +1826,11 @@ int main(int argc, char** argv) {
                 strata::GgufFile pg(o.ple_gguf);
                 if (const strata::MetaValue* v = pg.get("general.architecture")) ple_only = v->s == "strata-ple";
             } catch (const std::exception&) {}
-            if (!ple_only &&
+            // Append the PLE shard only when there IS one.  With --no-ple (any model without a PLE layer) the
+            // string is empty, and pushing it handed NativeDense::served_names an empty path: the load failed with
+            // "native dense: cannot open " - an empty filename, which is what made a pack that had already loaded
+            // its 41 expert layers and its Q2_K embedding look like a corrupt file.
+            if (!o.ple_gguf.empty() && !ple_only &&
                 std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
                 o.native_dense_gguf.push_back(o.ple_gguf);
         }
